@@ -1,0 +1,71 @@
+manifestVersion: 1
+name: "@kneel/nextcloud"
+version: "2026.07.17.1"
+description: |
+  Drive a [Nextcloud](https://nextcloud.com/) instance from swamp over its
+  CalDAV / WebDAV / OCS surfaces using an app-password (HTTP Basic) credential —
+  a first-class swamp node for a self-hosted cloud.
+
+  The model's first job is **event-level calendar sync**: upsert real VEVENTs
+  (keyed by `iCalUID`) into a Nextcloud calendar so a source calendar — e.g. a
+  Google calendar read by `@swamp/gcp/calendar` — appears as editable native
+  events that propagate to every CalDAV client, with swamp in the data path.
+
+  ## Methods
+
+  - **whoami** — verify app-password auth via OCS `cloud/user`; record the
+    authenticated `{userId, displayName, email}`. Auth smoke-test.
+  - **list_calendars** — PROPFIND the user's calendar home; record calendars as
+    `{displayName, path, color, hasSource}`. Webcal subscription **source URLs
+    are masked** (recorded as a boolean, never persisted).
+  - **put_events** — Rule-6 fan-out: CalDAV `PUT` a whole batch of events as
+    VEVENTs keyed by `iCalUID` (idempotent upsert). Records UIDs + per-item
+    outcomes only — no event PII.
+  - **delete_events** — Rule-6 fan-out: verify-then-`DELETE` events by
+    `iCalUID` (idempotent).
+
+  ## Security
+
+  - `appPassword` is a **sensitive** global argument — wire it to a vault at
+    model-create time, never inline.
+  - `baseUrl` is refined to require `https://` (Basic auth is only protected by
+    TLS).
+  - The `Authorization` header is never logged; event PII (SUMMARY/DESCRIPTION/
+    LOCATION/raw VEVENT bodies) is never logged and never persisted in resource
+    snapshots.
+
+  ## Quickstart
+
+  ```bash
+  # 1. store the app password in a vault
+  swamp vault put nextcloud appPassword     # hidden prompt
+
+  # 2. create the model, wiring the sensitive arg from the vault
+  swamp model create @kneel/nextcloud nc \
+    --global-arg baseUrl=https://cloud.example.com \
+    --global-arg username=neil \
+    --global-arg appPassword='${{ vault.get(nextcloud, appPassword) }}'
+
+  swamp model method run nc whoami          # auth proof
+  swamp model method run nc list_calendars  # discover the target calendar
+  ```
+
+  Reference recorded data with CEL:
+
+  ```
+  data.latest("nc", "main").attributes.calendars
+  ```
+repository: "https://github.com/NeilHanlon/swamp-nextcloud"
+paths:
+  base: manifest
+models:
+  - nextcloud.ts
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+labels:
+  - nextcloud
+  - caldav
+  - webdav
+  - ocs
+  - calendar
