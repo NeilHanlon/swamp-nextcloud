@@ -18,11 +18,21 @@ description: |
   - **list_calendars** — PROPFIND the user's calendar home; record calendars as
     `{displayName, path, color, hasSource}`. Webcal subscription **source URLs
     are masked** (recorded as a boolean, never persisted).
+  - **create_calendar** — provision a calendar collection via `MKCALENDAR`
+    (idempotent: an existing collection reports `created=false`, not an error).
+  - **list_events** — CalDAV `calendar-query` REPORT over a time window; records
+    `{uid, dtstart, hasProvenance}` per event — **UID/DTSTART/provenance only,
+    no PII**. The read side of reconciliation.
   - **put_events** — Rule-6 fan-out: CalDAV `PUT` a whole batch of events as
-    VEVENTs keyed by `iCalUID` (idempotent upsert). Records UIDs + per-item
-    outcomes only — no event PII.
+    VEVENTs keyed by `iCalUID` (idempotent upsert). Every VEVENT is stamped with
+    the `X-SWAMP-SYNC` provenance marker and recurring timed events keep their
+    `TZID` (DST-correct expansion). Records UIDs + per-item outcomes only — no
+    event PII. An empty batch is a no-op.
   - **delete_events** — Rule-6 fan-out: verify-then-`DELETE` events by
-    `iCalUID` (idempotent).
+    `iCalUID` (idempotent). By default (`requireProvenance=true`) it refuses to
+    delete any event lacking the `X-SWAMP-SYNC` marker, so foreign events sharing
+    the calendar are never removed. Supports `dryRun=true` to preview
+    (`would-delete`) without mutating. An empty batch is a no-op.
 
   ## Security
 

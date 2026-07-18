@@ -190,16 +190,66 @@ const PutEventsArgsSchema = z.object({
     ),
   events: z
     .array(EventInputSchema)
-    .min(1)
-    .describe("Events to upsert (fan-out: one dispatch handles all)."),
+    .default([])
+    .describe(
+      "Events to upsert (fan-out: one dispatch handles all). An empty batch is a no-op so a sync workflow can pass it through unconditionally.",
+    ),
 });
 
 const DeleteEventsArgsSchema = z.object({
   calendar: z.string().min(1).describe("Target calendar name."),
   uids: z
     .array(z.string().min(1))
+    .default([])
+    .describe("iCalUIDs to delete (fan-out). An empty batch is a no-op."),
+  requireProvenance: z
+    .boolean()
+    .default(true)
+    .describe(
+      "When true (default), GET each event and refuse to delete any that lacks the X-SWAMP-SYNC marker (server-side reconciliation guard, V-2). Set false only for a raw delete.",
+    ),
+  dryRun: z
+    .boolean()
+    .default(false)
+    .describe(
+      "When true, run the full existence + provenance decision for each uid but issue no DELETE. Events that would be removed are reported as 'would-delete'; nothing is mutated. A safe preview of a reconciliation delete.",
+    ),
+});
+
+/** RFC3339 window bound (used by list_events time-range filtering). */
+const Rfc3339 = z
+  .string()
+  .regex(
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})$/,
+    "must be an RFC3339 timestamp with an explicit zone",
+  );
+
+const ListEventsArgsSchema = z.object({
+  calendar: z.string().min(1).describe("Target calendar name."),
+  timeMin: Rfc3339.describe("Window start, inclusive (RFC3339)."),
+  timeMax: Rfc3339.describe("Window end, exclusive (RFC3339)."),
+});
+
+const CreateCalendarArgsSchema = z.object({
+  calendar: z
+    .string()
     .min(1)
-    .describe("iCalUIDs to delete (fan-out)."),
+    .regex(
+      /^[A-Za-z0-9._-]+$/,
+      "calendar name (collection slug) must be URL/path safe",
+    )
+    .describe("Calendar collection slug to create, e.g. 'gcal-sync'."),
+  displayName: z
+    .string()
+    .min(1)
+    .max(120)
+    .optional()
+    .describe("Human-readable calendar name (defaults to the slug)."),
+  color: z
+    .string()
+    .regex(/^#[0-9A-Fa-f]{6}$/, "color must be #RRGGBB")
+    .optional()
+    .describe("Calendar color as #RRGGBB."),
 });
 
 // ---------------------------------------------------------------------------
@@ -230,9 +280,22 @@ const UpsertOutcomeSchema = z.object({
 
 const DeleteOutcomeSchema = z.object({
   uid: z.string(),
-  outcome: z.enum(["deleted", "not-found", "failed"]),
+  outcome: z.enum([
+    "deleted",
+    "would-delete",
+    "not-found",
+    "skipped",
+    "failed",
+  ]),
   httpStatus: z.number(),
   error: z.string().optional(),
+});
+
+/** A single event read back from a calendar — UID + DTSTART + provenance only. */
+const CalEventRefSchema = z.object({
+  uid: z.string(),
+  dtstart: z.string(),
+  hasProvenance: z.boolean(),
 });
 
 // ---------------------------------------------------------------------------
@@ -410,6 +473,58 @@ const PROPFIND_CALENDARS_BODY = `<?xml version="1.0" encoding="utf-8"?>
   </d:prop>
 </d:propfind>`;
 
+/**
+ * Body for a CalDAV `calendar-query` REPORT that returns, for every VEVENT whose
+ * time-range overlaps [start, end), a partial calendar-data carrying only UID,
+ * DTSTART and the provenance marker — never SUMMARY/DESCRIPTION/LOCATION, so no
+ * PII is pulled. `start`/`end` are compact-UTC stamps (YYYYMMDDTHHMMSSZ).
+ */
+export function calendarQueryBody(start: string, end: string): string {
+  const s = start.replace(/[^0-9TZ]/g, "");
+  const e = end.replace(/[^0-9TZ]/g, "");
+  return `<?xml version="1.0" encoding="utf-8"?>
+<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop>
+    <d:getetag/>
+    <c:calendar-data>
+      <c:comp name="VCALENDAR">
+        <c:comp name="VEVENT">
+          <c:prop name="UID"/>
+          <c:prop name="DTSTART"/>
+          <c:prop name="${PROVENANCE_PROP}"/>
+        </c:comp>
+      </c:comp>
+    </c:calendar-data>
+  </d:prop>
+  <c:filter>
+    <c:comp-filter name="VCALENDAR">
+      <c:comp-filter name="VEVENT">
+        <c:time-range start="${s}" end="${e}"/>
+      </c:comp-filter>
+    </c:comp-filter>
+  </c:filter>
+</c:calendar-query>`;
+}
+
+/**
+ * Body for MKCALENDAR. `displayName` is XML-escaped; `color` is already
+ * `#RRGGBB`-validated by the schema.
+ */
+export function mkcalendarBody(displayName: string, color?: string): string {
+  const colorProp = color
+    ? `\n      <ic:calendar-color>${color}</ic:calendar-color>`
+    : "";
+  return `<?xml version="1.0" encoding="utf-8"?>
+<c:mkcalendar xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"
+              xmlns:ic="http://apple.com/ns/ical/">
+  <d:set>
+    <d:prop>
+      <d:displayname>${xmlEscape(displayName)}</d:displayname>${colorProp}
+    </d:prop>
+  </d:set>
+</c:mkcalendar>`;
+}
+
 /** Parse a calendars PROPFIND multistatus into safe Calendar rows. */
 export function parseCalendars(xml: string): z.infer<typeof CalendarSchema>[] {
   const calendars: z.infer<typeof CalendarSchema>[] = [];
@@ -499,9 +614,45 @@ export function hasZone(dateTime: string): boolean {
   return /(?:Z|[+-]\d{2}:?\d{2})$/.test(dateTime);
 }
 
+/** Strip a leading/enclosing IANA TZID down to the safe charset. */
+function sanitizeTzid(tz: string): string {
+  return tz.replace(/[^A-Za-z0-9_+\-\/]/g, "");
+}
+
+/**
+ * Wall-clock time (`YYYYMMDDTHHMMSS`) of an RFC3339 instant as observed in `tz`.
+ * Robust to any input offset: the absolute instant is converted to the zone's
+ * civil time via `Intl`, so a recurring `DTSTART;TZID=` carries the correct
+ * floating local time for per-occurrence DST expansion. A floating input (no
+ * offset) is already local and passes through `compactLocal`.
+ */
+export function wallClockInZone(dateTime: string, tz: string): string {
+  if (!hasZone(dateTime)) return compactLocal(dateTime);
+  const d = new Date(dateTime);
+  if (isNaN(d.getTime())) {
+    throw new Error(`Invalid dateTime: ${clip(dateTime, 40)}`);
+  }
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+  const p: Record<string, string> = {};
+  for (const part of fmt.formatToParts(d)) p[part.type] = part.value;
+  return `${p.year}${p.month}${p.day}T${p.hour}${p.minute}${p.second}`;
+}
+
 /**
  * Render a DTSTART/DTEND line.
  * - all-day (`date`) → `;VALUE=DATE:YYYYMMDD`
+ * - recurring timed with a `timeZone` → `;TZID=<tz>:YYYYMMDDTHHMMSS` at the
+ *   event's wall-clock time, so the server expands each occurrence in that zone
+ *   and DST boundaries do not shift the local time (AR-6). `preferLocal` opts in.
  * - timed with explicit offset/Z → normalized to UTC `YYYYMMDDTHHMMSSZ`
  *   (deterministic, no VTIMEZONE needed)
  * - timed floating (no offset) with `timeZone` → `;TZID=<tz>:YYYYMMDDTHHMMSS`
@@ -511,9 +662,17 @@ export function hasZone(dateTime: string): boolean {
 export function renderDtLine(
   prop: "DTSTART" | "DTEND",
   t: z.infer<typeof EventTimeSchema>,
+  opts: { preferLocal?: boolean } = {},
 ): string {
   if (t.date) return `${prop};VALUE=DATE:${compactDate(t.date)}`;
   if (t.dateTime) {
+    // Recurring events must keep a zoned wall-clock time; folding to a fixed UTC
+    // instant would drift by the DST offset for occurrences on the other side
+    // of a transition (AR-6).
+    if (opts.preferLocal && t.timeZone) {
+      const tz = sanitizeTzid(t.timeZone);
+      return `${prop};TZID=${tz}:${wallClockInZone(t.dateTime, tz)}`;
+    }
     if (hasZone(t.dateTime)) {
       const d = new Date(t.dateTime);
       if (isNaN(d.getTime())) {
@@ -522,7 +681,7 @@ export function renderDtLine(
       return `${prop}:${utcStamp(d)}`;
     }
     if (t.timeZone) {
-      const tz = t.timeZone.replace(/[^A-Za-z0-9_+\-\/]/g, "");
+      const tz = sanitizeTzid(t.timeZone);
       return `${prop};TZID=${tz}:${compactLocal(t.dateTime)}`;
     }
     throw new Error(
@@ -533,12 +692,25 @@ export function renderDtLine(
 }
 
 /**
+ * Provenance marker. Every VEVENT this model writes carries `X-SWAMP-SYNC`, so a
+ * reconciliation delete can tell a swamp-managed mirror event apart from a
+ * foreign event that merely shares a calendar — foreign events are never
+ * deleted. Read back via `list_events` (`hasProvenance`) and re-checked
+ * server-side in `delete_events` (V-2 defense in depth).
+ */
+export const PROVENANCE_PROP = "X-SWAMP-SYNC";
+export const PROVENANCE_VALUE = "gcal-nc-sync";
+
+/**
  * Build a full VCALENDAR wrapping a single VEVENT for the given event. Every
  * emitted field is escaped or digit/enum-constrained, so no caller value can
  * inject an iCal property or component even if schema validation is bypassed.
  * `now` is injected for deterministic testing (DTSTAMP).
  */
 export function buildVcalendar(ev: EventInput, now: Date = new Date()): string {
+  // A recurring timed event keeps its zone (TZID + wall-clock) so occurrences
+  // expand correctly across DST; a single event folds to a UTC instant.
+  const preferLocal = (ev.recurrence?.length ?? 0) > 0;
   const lines: string[] = [
     "BEGIN:VCALENDAR",
     "VERSION:2.0",
@@ -547,9 +719,10 @@ export function buildVcalendar(ev: EventInput, now: Date = new Date()): string {
     "BEGIN:VEVENT",
     `UID:${escapeText(ev.uid)}`,
     `DTSTAMP:${utcStamp(now)}`,
-    renderDtLine("DTSTART", ev.start),
-    renderDtLine("DTEND", ev.end),
+    renderDtLine("DTSTART", ev.start, { preferLocal }),
+    renderDtLine("DTEND", ev.end, { preferLocal }),
     `SEQUENCE:${ev.sequence ?? 0}`,
+    `${PROVENANCE_PROP}:${PROVENANCE_VALUE}`,
   ];
   if (ev.summary) lines.push(`SUMMARY:${escapeText(ev.summary)}`);
   if (ev.description) lines.push(`DESCRIPTION:${escapeText(ev.description)}`);
@@ -562,6 +735,98 @@ export function buildVcalendar(ev: EventInput, now: Date = new Date()): string {
   }
   lines.push("END:VEVENT", "END:VCALENDAR");
   return lines.map(foldLine).join("\r\n") + "\r\n";
+}
+
+// ---------------------------------------------------------------------------
+// iCalendar (VEVENT) reading — parse a CalDAV calendar-query REPORT
+// ---------------------------------------------------------------------------
+
+/** Decode the handful of XML entities a DAV server may emit in text content. */
+export function decodeXmlEntities(s: string): string {
+  return s
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#0*13;?/g, "\r")
+    .replace(/&#0*10;?/g, "\n")
+    .replace(/&amp;/g, "&");
+}
+
+/** Reverse RFC 5545 §3.3.11 TEXT escaping (UID is a TEXT-typed value). */
+export function unescapeText(s: string): string {
+  return s.replace(
+    /\\([\\;,nN])/g,
+    (_m, c) => (c === "n" || c === "N" ? "\n" : c),
+  );
+}
+
+/**
+ * Read a single iCal property value from a VEVENT body. Unfolds continuation
+ * lines first, tolerates property parameters (`;TZID=…`, `;VALUE=DATE`), and is
+ * case-insensitive on the property name. Returns the raw (still-escaped) value.
+ */
+export function icalProp(ics: string, prop: string): string | null {
+  const unfolded = ics.replace(/\r\n[ \t]/g, "").replace(/\n[ \t]/g, "");
+  const re = new RegExp(
+    `(?:^|\\n)${prop}(?:;[^:\\n]*)?:([^\\n\\r]*)`,
+    "i",
+  );
+  const m = re.exec(unfolded);
+  return m ? m[1].trim() : null;
+}
+
+/** A minimal event reference read back from a calendar (no PII). */
+export type CalEventRef = {
+  uid: string;
+  dtstart: string;
+  hasProvenance: boolean;
+};
+
+/**
+ * Parse a CalDAV `calendar-query` REPORT multistatus into `{uid, dtstart,
+ * hasProvenance}` rows. Only UID, DTSTART and the provenance marker are read —
+ * SUMMARY/DESCRIPTION/LOCATION are never extracted, so no event PII is
+ * persisted. `hasProvenance` is what gates a reconciliation delete.
+ */
+export function parseCalendarReport(xml: string): CalEventRef[] {
+  const out: CalEventRef[] = [];
+  for (const resp of extractAll(xml, "response")) {
+    const raw = extractFirst(resp, "calendar-data");
+    if (!raw) continue;
+    const ics = decodeXmlEntities(raw);
+    const uidRaw = icalProp(ics, "UID");
+    if (!uidRaw) continue;
+    out.push({
+      uid: unescapeText(uidRaw),
+      dtstart: icalProp(ics, "DTSTART") ?? "",
+      hasProvenance: icalProp(ics, PROVENANCE_PROP) !== null,
+    });
+  }
+  return out;
+}
+
+/** True if an .ics body carries this model's provenance marker (V-2 recheck). */
+export function icsHasProvenance(ics: string): boolean {
+  return icalProp(ics, PROVENANCE_PROP) !== null;
+}
+
+/** Minimal XML text escape for values placed into request bodies. */
+export function xmlEscape(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/** Compact-UTC (`YYYYMMDDTHHMMSSZ`) form of an RFC3339 instant for a REPORT filter. */
+export function toCompactUtc(rfc3339: string): string {
+  const d = new Date(rfc3339);
+  if (isNaN(d.getTime())) {
+    throw new Error(`Invalid window bound: ${clip(rfc3339, 40)}`);
+  }
+  return utcStamp(d);
 }
 
 // ---------------------------------------------------------------------------
@@ -605,12 +870,38 @@ export const model = {
       description: "Outcome of an event deletion batch (UIDs + outcomes only).",
       schema: z.object({
         calendar: z.string(),
+        dryRun: z.boolean(),
         deleted: z.number(),
+        wouldDelete: z.number(),
+        skipped: z.number(),
         failed: z.number(),
         results: z.array(DeleteOutcomeSchema),
       }),
       lifetime: "1d" as const,
       garbageCollection: 7,
+    },
+    events: {
+      description:
+        "Events read back from a calendar within a time window (UID + DTSTART + provenance flag only, no PII).",
+      schema: z.object({
+        calendar: z.string(),
+        timeMin: z.string(),
+        timeMax: z.string(),
+        events: z.array(CalEventRefSchema),
+        count: z.number(),
+      }),
+      lifetime: "1d" as const,
+      garbageCollection: 7,
+    },
+    provision: {
+      description: "Outcome of a calendar provisioning (MKCALENDAR) request.",
+      schema: z.object({
+        calendar: z.string(),
+        created: z.boolean(),
+        httpStatus: z.number(),
+      }),
+      lifetime: "infinite" as const,
+      garbageCollection: 3,
     },
   },
 
@@ -684,6 +975,84 @@ export const model = {
       },
     },
 
+    list_events: {
+      description:
+        "List events in a calendar within a time window via a CalDAV calendar-query REPORT. Returns UID + DTSTART + provenance flag only (no PII) — the read side of reconciliation.",
+      arguments: ListEventsArgsSchema,
+      execute: async (
+        args: z.infer<typeof ListEventsArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const url = calendarUrl(g.baseUrl, g.username, args.calendar);
+        const body = calendarQueryBody(
+          toCompactUtc(args.timeMin),
+          toCompactUtc(args.timeMax),
+        );
+        const resp = await davRequest("REPORT", url, auth, {
+          headers: {
+            "Content-Type": "application/xml; charset=utf-8",
+            Depth: "1",
+          },
+          body,
+          log: ctx.logger,
+        });
+        const events = parseCalendarReport(resp.text);
+        const withProv = events.filter((e) => e.hasProvenance).length;
+        ctx.logger?.info(
+          "Read {count} events from {calendar} ({withProv} swamp-stamped)",
+          { count: events.length, calendar: args.calendar, withProv },
+        );
+        const handle = await ctx.writeResource("events", `events-${args.calendar}`, {
+          calendar: args.calendar,
+          timeMin: args.timeMin,
+          timeMax: args.timeMax,
+          events,
+          count: events.length,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    create_calendar: {
+      description:
+        "Provision a calendar collection via MKCALENDAR (idempotent: an existing collection is reported created=false, not an error).",
+      arguments: CreateCalendarArgsSchema,
+      execute: async (
+        args: z.infer<typeof CreateCalendarArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const url = calendarUrl(g.baseUrl, g.username, args.calendar);
+        const body = mkcalendarBody(
+          args.displayName ?? args.calendar,
+          args.color,
+        );
+        // 405 Method Not Allowed = the collection already exists (MKCALENDAR is
+        // not allowed on an existing resource). Treat as an idempotent no-op.
+        const resp = await davRequest("MKCALENDAR", url, auth, {
+          headers: { "Content-Type": "application/xml; charset=utf-8" },
+          okStatuses: [201, 405],
+          log: ctx.logger,
+        });
+        const created = resp.status === 201;
+        ctx.logger?.info(
+          created
+            ? "Created calendar {calendar}"
+            : "Calendar {calendar} already exists",
+          { calendar: args.calendar },
+        );
+        const handle = await ctx.writeResource("provision", `provision-${args.calendar}`, {
+          calendar: args.calendar,
+          created,
+          httpStatus: resp.status,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
     put_events: {
       description:
         "Upsert events (VEVENTs keyed by iCalUID) into a calendar via CalDAV PUT. Fan-out: one dispatch handles the whole batch.",
@@ -731,7 +1100,7 @@ export const model = {
             failed,
           },
         );
-        const handle = await ctx.writeResource("upsert", args.calendar, {
+        const handle = await ctx.writeResource("upsert", `upsert-${args.calendar}`, {
           calendar: args.calendar,
           upserted: results.length - failed,
           failed,
@@ -756,14 +1125,45 @@ export const model = {
         for (const uid of args.uids) {
           const href = eventHref(g.baseUrl, g.username, args.calendar, uid);
           try {
-            // Existence probe. Some DAV backends answer HEAD on an object with
-            // 405; tolerate that and fall through to an idempotent DELETE.
-            const head = await davRequest("HEAD", href, auth, {
-              okStatuses: [404, 405],
-              log: ctx.logger,
-            });
-            if (head.status === 404) {
-              results.push({ uid, outcome: "not-found", httpStatus: 404 });
+            if (args.requireProvenance) {
+              // V-2: fetch the event and refuse to delete anything that is not a
+              // swamp-managed mirror. A 404 here is simply "already gone". The
+              // body carries PII, so it is checked for the marker and discarded
+              // — never logged, never persisted.
+              const get = await davRequest("GET", href, auth, {
+                okStatuses: [200, 404],
+                log: ctx.logger,
+              });
+              if (get.status === 404) {
+                results.push({ uid, outcome: "not-found", httpStatus: 404 });
+                continue;
+              }
+              if (!icsHasProvenance(get.text)) {
+                results.push({
+                  uid,
+                  outcome: "skipped",
+                  httpStatus: get.status,
+                  error:
+                    "refusing to delete: event lacks the X-SWAMP-SYNC provenance marker",
+                });
+                continue;
+              }
+            } else {
+              // Existence probe. Some DAV backends answer HEAD on an object with
+              // 405; tolerate that and fall through to an idempotent DELETE.
+              const head = await davRequest("HEAD", href, auth, {
+                okStatuses: [404, 405],
+                log: ctx.logger,
+              });
+              if (head.status === 404) {
+                results.push({ uid, outcome: "not-found", httpStatus: 404 });
+                continue;
+              }
+            }
+            // The uid exists and (if required) is provenance-stamped. In dry-run
+            // report what would happen and mutate nothing.
+            if (args.dryRun) {
+              results.push({ uid, outcome: "would-delete", httpStatus: 200 });
               continue;
             }
             const del = await davRequest("DELETE", href, auth, {
@@ -787,13 +1187,28 @@ export const model = {
 
         const failed = results.filter((r) => r.outcome === "failed").length;
         const deleted = results.filter((r) => r.outcome === "deleted").length;
+        const wouldDelete =
+          results.filter((r) => r.outcome === "would-delete").length;
+        const skipped = results.filter((r) => r.outcome === "skipped").length;
         ctx.logger?.info(
-          "Deleted {deleted} events from {calendar} ({failed} failed)",
-          { deleted, calendar: args.calendar, failed },
+          args.dryRun
+            ? "Dry-run: would delete {wouldDelete} of {total} from {calendar} ({skipped} skipped, {failed} failed)"
+            : "Deleted {deleted} events from {calendar} ({skipped} skipped, {failed} failed)",
+          {
+            deleted,
+            wouldDelete,
+            total: results.length,
+            calendar: args.calendar,
+            skipped,
+            failed,
+          },
         );
-        const handle = await ctx.writeResource("deletions", args.calendar, {
+        const handle = await ctx.writeResource("deletions", `deletions-${args.calendar}`, {
           calendar: args.calendar,
+          dryRun: args.dryRun,
           deleted,
+          wouldDelete,
+          skipped,
           failed,
           results,
         });

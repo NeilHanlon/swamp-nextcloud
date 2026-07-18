@@ -2,10 +2,12 @@ import { assert, assertEquals, assertThrows } from "jsr:@std/assert@1";
 import {
   basicAuth,
   buildVcalendar,
+  calendarQueryBody,
   calendarUrl,
   clip,
   compactDate,
   davBase,
+  decodeXmlEntities,
   escapeText,
   EventInputSchema,
   eventHref,
@@ -17,12 +19,21 @@ import {
   hasControlChars,
   hasElement,
   hasZone,
+  icalProp,
+  icsHasProvenance,
+  mkcalendarBody,
   ocsBase,
   octetLength,
+  parseCalendarReport,
   parseCalendars,
+  PROVENANCE_PROP,
   renderDtLine,
   safePath,
+  toCompactUtc,
+  unescapeText,
   utcStamp,
+  wallClockInZone,
+  xmlEscape,
 } from "./nextcloud.ts";
 
 // ── auth + URL construction ────────────────────────────────────────────────
@@ -346,4 +357,183 @@ Deno.test("renderDtLine: floating time uses TZID, offset normalizes to UTC, floa
 Deno.test("clip strips control chars and caps length", () => {
   assertEquals(clip("a\r\nb\tc"), "a  b c");
   assertEquals(clip("x".repeat(500)).length, 160);
+});
+
+// ── AR-6: recurring events keep their zone (DST-correct expansion) ───────────
+
+Deno.test("wallClockInZone maps any offset to the zone's civil time", () => {
+  // 09:00 in a -05:00 offset IS 09:00 wall-clock in New York (winter).
+  assertEquals(
+    wallClockInZone("2026-01-15T09:00:00-05:00", "America/New_York"),
+    "20260115T090000",
+  );
+  // Same instant expressed as UTC converts to the same NY wall time.
+  assertEquals(
+    wallClockInZone("2026-01-15T14:00:00Z", "America/New_York"),
+    "20260115T090000",
+  );
+  // A floating (offset-less) input is already local.
+  assertEquals(
+    wallClockInZone("2026-01-15T09:00:00", "America/New_York"),
+    "20260115T090000",
+  );
+});
+
+Deno.test("renderDtLine preferLocal emits TZID wall-clock for recurring events", () => {
+  assertEquals(
+    renderDtLine(
+      "DTSTART",
+      { dateTime: "2026-01-15T09:00:00-05:00", timeZone: "America/New_York" },
+      { preferLocal: true },
+    ),
+    "DTSTART;TZID=America/New_York:20260115T090000",
+  );
+  // Without preferLocal the zoned time still folds to UTC (single-event path).
+  assertEquals(
+    renderDtLine(
+      "DTSTART",
+      { dateTime: "2026-01-15T09:00:00-05:00", timeZone: "America/New_York" },
+    ),
+    "DTSTART:20260115T140000Z",
+  );
+  // preferLocal but no timeZone → falls back to UTC folding, never throws.
+  assertEquals(
+    renderDtLine(
+      "DTEND",
+      { dateTime: "2026-01-15T09:30:00-05:00" },
+      { preferLocal: true },
+    ),
+    "DTEND:20260115T143000Z",
+  );
+});
+
+Deno.test("buildVcalendar: recurring timed event carries TZID, not a UTC instant (AR-6)", () => {
+  const ics = buildVcalendar(
+    {
+      uid: "weekly@google.com",
+      summary: "Weekly sync",
+      start: { dateTime: "2026-01-15T09:00:00-05:00", timeZone: "America/New_York" },
+      end: { dateTime: "2026-01-15T09:30:00-05:00", timeZone: "America/New_York" },
+      recurrence: ["RRULE:FREQ=WEEKLY;BYDAY=TH"],
+    },
+    new Date("2026-01-01T00:00:00Z"),
+  );
+  assert(ics.includes("DTSTART;TZID=America/New_York:20260115T090000\r\n"));
+  assert(ics.includes("DTEND;TZID=America/New_York:20260115T093000\r\n"));
+  assert(!ics.includes("DTSTART:20260115T140000Z"), "must not fold to UTC");
+});
+
+Deno.test("buildVcalendar: single timed event still folds to UTC", () => {
+  const ics = buildVcalendar(
+    {
+      uid: "one@google.com",
+      start: { dateTime: "2026-01-15T09:00:00-05:00", timeZone: "America/New_York" },
+      end: { dateTime: "2026-01-15T09:30:00-05:00", timeZone: "America/New_York" },
+    },
+    new Date("2026-01-01T00:00:00Z"),
+  );
+  assert(ics.includes("DTSTART:20260115T140000Z\r\n"));
+});
+
+// ── provenance stamp (X-SWAMP-SYNC) ─────────────────────────────────────────
+
+Deno.test("buildVcalendar stamps every VEVENT with X-SWAMP-SYNC provenance", () => {
+  const ics = buildVcalendar({
+    uid: "p1",
+    start: { date: "2026-12-25" },
+    end: { date: "2026-12-26" },
+  }, new Date("2026-07-17T00:00:00Z"));
+  assert(ics.includes("X-SWAMP-SYNC:gcal-nc-sync\r\n"));
+  assert(icsHasProvenance(ics), "icsHasProvenance detects the stamp");
+});
+
+Deno.test("icsHasProvenance is false for a foreign (unstamped) event", () => {
+  const foreign =
+    "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:foreign\r\nDTSTART:20260101T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+  assert(!icsHasProvenance(foreign));
+});
+
+// ── iCal property reading / unescaping ──────────────────────────────────────
+
+Deno.test("icalProp reads values, tolerating params and folding", () => {
+  const ics =
+    "BEGIN:VEVENT\r\nUID:abc@goo\r\n gle.com\r\nDTSTART;TZID=America/New_York:20260115T090000\r\nEND:VEVENT";
+  assertEquals(icalProp(ics, "UID"), "abc@google.com"); // unfolded
+  assertEquals(icalProp(ics, "DTSTART"), "20260115T090000"); // param stripped
+  assertEquals(icalProp(ics, "SUMMARY"), null);
+});
+
+Deno.test("unescapeText reverses RFC5545 TEXT escaping", () => {
+  assertEquals(unescapeText("a\\; b\\, c\\\\d\\ne"), "a; b, c\\d\ne");
+});
+
+Deno.test("decodeXmlEntities decodes the DAV entity set", () => {
+  assertEquals(decodeXmlEntities("a&amp;b&lt;c&gt;d"), "a&b<c>d");
+});
+
+// ── calendar-query REPORT parsing ───────────────────────────────────────────
+
+const REPORT_FIXTURE = `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/remote.php/dav/calendars/neil/gcal-sync/stamped.ics</d:href>
+    <d:propstat><d:prop>
+      <cal:calendar-data>BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:stamped@google.com
+DTSTART:20260115T090000Z
+X-SWAMP-SYNC:gcal-nc-sync
+END:VEVENT
+END:VCALENDAR</cal:calendar-data>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/calendars/neil/gcal-sync/foreign.ics</d:href>
+    <d:propstat><d:prop>
+      <cal:calendar-data>BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:foreign@example.com
+DTSTART:20260116T100000Z
+END:VEVENT
+END:VCALENDAR</cal:calendar-data>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+</d:multistatus>`;
+
+Deno.test("parseCalendarReport extracts uid/dtstart/provenance, no PII", () => {
+  const rows = parseCalendarReport(REPORT_FIXTURE);
+  assertEquals(rows.length, 2);
+  const stamped = rows.find((r) => r.uid === "stamped@google.com")!;
+  assertEquals(stamped.dtstart, "20260115T090000Z");
+  assertEquals(stamped.hasProvenance, true);
+  const foreign = rows.find((r) => r.uid === "foreign@example.com")!;
+  assertEquals(foreign.hasProvenance, false);
+});
+
+// ── request-body builders ───────────────────────────────────────────────────
+
+Deno.test("calendarQueryBody embeds a sanitized time-range and requests the marker", () => {
+  const body = calendarQueryBody("20260101T000000Z", "20260201T000000Z");
+  assert(body.includes(`start="20260101T000000Z"`));
+  assert(body.includes(`end="20260201T000000Z"`));
+  assert(body.includes(`<c:prop name="${PROVENANCE_PROP}"/>`));
+  // No SUMMARY/DESCRIPTION requested → server returns no PII.
+  assert(!body.includes("SUMMARY"));
+});
+
+Deno.test("toCompactUtc normalizes an RFC3339 bound and rejects garbage", () => {
+  assertEquals(toCompactUtc("2026-01-01T00:00:00Z"), "20260101T000000Z");
+  assertEquals(toCompactUtc("2026-01-01T00:00:00-05:00"), "20260101T050000Z");
+  assertThrows(() => toCompactUtc("not-a-date"));
+});
+
+Deno.test("mkcalendarBody escapes displayname and includes color when given", () => {
+  const body = mkcalendarBody("A & B <x>", "#0082c9");
+  assert(body.includes("<d:displayname>A &amp; B &lt;x&gt;</d:displayname>"));
+  assert(body.includes("<ic:calendar-color>#0082c9</ic:calendar-color>"));
+  assert(!mkcalendarBody("plain").includes("calendar-color"));
+});
+
+Deno.test("xmlEscape escapes the XML metacharacters", () => {
+  assertEquals(xmlEscape(`a&b<c>d"e`), "a&amp;b&lt;c&gt;d&quot;e");
 });
