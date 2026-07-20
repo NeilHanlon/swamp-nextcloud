@@ -3338,7 +3338,10 @@ export const model = {
           try {
             if (args.requireProvenance) {
               const get = await davRequest("GET", url, auth, {
-                headers: { Accept: "application/json", "OCS-APIRequest": "true" },
+                headers: {
+                  Accept: "application/json",
+                  "OCS-APIRequest": "true",
+                },
                 okStatuses: [200, 404],
                 log: ctx.logger,
               });
@@ -3371,7 +3374,10 @@ export const model = {
             } else {
               // Without requireProvenance, just check existence via GET.
               const head = await davRequest("GET", url, auth, {
-                headers: { Accept: "application/json", "OCS-APIRequest": "true" },
+                headers: {
+                  Accept: "application/json",
+                  "OCS-APIRequest": "true",
+                },
                 okStatuses: [200, 404],
                 log: ctx.logger,
               });
