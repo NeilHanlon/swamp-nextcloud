@@ -1370,3 +1370,220 @@ Deno.test("DeleteNotesArgsSchema defaults match delete_events pattern", () => {
   assertEquals(args.maxDeletes, 50);
   assertEquals(args.ids, []);
 });
+
+// ── OCS Share API tests ───────────────────────────────────────────────────
+
+import {
+  ALL,
+  CreatePublicLinkArgsSchema,
+  CreateShareArgsSchema,
+  ListSharesArgsSchema,
+  PERM_ALLOWLIST,
+  PERM_CREATE,
+  PERM_DELETE,
+  PERM_READ,
+  PERM_SHARE,
+  PERM_UPDATE,
+  READ_WRITE,
+  READ_WRITE_SHARE,
+  RevokeShareArgsSchema,
+  SHARE_TYPE_EMAIL,
+  SHARE_TYPE_FEDERATED,
+  SHARE_TYPE_GROUP,
+  SHARE_TYPE_PUBLIC_LINK,
+  SHARE_TYPE_USER,
+  SharePermissionsSchema,
+  ShareResultSchema,
+  ShareSchema,
+  UpdateShareArgsSchema,
+  VIEW_ONLY,
+  sharesBase,
+  validateSharePath,
+} from "./nextcloud.ts";
+
+Deno.test("sharesBase constructs OCS Share API URL and strips trailing slash", () => {
+  assertEquals(
+    sharesBase("https://cloud.example.com"),
+    "https://cloud.example.com/ocs/v2.php/apps/files_sharing/api/v1/shares",
+  );
+  assertEquals(
+    sharesBase("https://cloud.example.com/"),
+    "https://cloud.example.com/ocs/v2.php/apps/files_sharing/api/v1/shares",
+  );
+});
+
+Deno.test("permission constants have correct bitmask values", () => {
+  assertEquals(PERM_READ, 1);
+  assertEquals(PERM_UPDATE, 2);
+  assertEquals(PERM_CREATE, 4);
+  assertEquals(PERM_DELETE, 8);
+  assertEquals(PERM_SHARE, 16);
+  assertEquals(VIEW_ONLY, 1);
+  assertEquals(READ_WRITE, 7);
+  assertEquals(READ_WRITE_SHARE, 23);
+  assertEquals(ALL, 31);
+});
+
+Deno.test("share type constants have correct values", () => {
+  assertEquals(SHARE_TYPE_USER, 0);
+  assertEquals(SHARE_TYPE_GROUP, 1);
+  assertEquals(SHARE_TYPE_PUBLIC_LINK, 3);
+  assertEquals(SHARE_TYPE_EMAIL, 4);
+  assertEquals(SHARE_TYPE_FEDERATED, 6);
+});
+
+Deno.test("validateSharePath accepts valid relative paths", () => {
+  assertEquals(validateSharePath("Documents/report.pdf"), "Documents/report.pdf");
+  assertEquals(validateSharePath("file.txt"), "file.txt");
+  assertEquals(validateSharePath("a/b/c"), "a/b/c");
+});
+
+Deno.test("validateSharePath rejects empty path", () => {
+  assertThrows(() => validateSharePath(""), Error, "must not be empty");
+});
+
+Deno.test("validateSharePath rejects absolute paths", () => {
+  assertThrows(() => validateSharePath("/etc/passwd"), Error, "must be relative");
+});
+
+Deno.test("validateSharePath rejects .. traversal", () => {
+  assertThrows(() => validateSharePath("../secret"), Error, "..");
+  assertThrows(() => validateSharePath("a/../../etc"), Error, "..");
+});
+
+Deno.test("validateSharePath rejects NUL bytes", () => {
+  assertThrows(() => validateSharePath("file\0.txt"), Error, "NUL");
+});
+
+Deno.test("validateSharePath rejects empty segments", () => {
+  assertThrows(() => validateSharePath("a//b"), Error, "empty segment");
+  assertThrows(() => validateSharePath("a/b/"), Error, "empty segment");
+});
+
+Deno.test("validateSharePath rejects . segments", () => {
+  assertThrows(() => validateSharePath("./file"), Error, ".");
+});
+
+Deno.test("validateSharePath rejects backslash start", () => {
+  assertThrows(() => validateSharePath("\\file"), Error, "backslash");
+});
+
+Deno.test("SharePermissionsSchema accepts valid allowlist values", () => {
+  assertEquals(SharePermissionsSchema.parse(1), 1);
+  assertEquals(SharePermissionsSchema.parse(7), 7);
+  assertEquals(SharePermissionsSchema.parse(23), 23);
+  assertEquals(SharePermissionsSchema.parse(31), 31);
+});
+
+Deno.test("SharePermissionsSchema rejects values not in allowlist", () => {
+  assertThrows(() => SharePermissionsSchema.parse(0));
+  assertThrows(() => SharePermissionsSchema.parse(2));
+  assertThrows(() => SharePermissionsSchema.parse(3));
+  assertThrows(() => SharePermissionsSchema.parse(5));
+  assertThrows(() => SharePermissionsSchema.parse(15));
+  assertThrows(() => SharePermissionsSchema.parse(32));
+});
+
+Deno.test("PERM_ALLOWLIST contains exactly the four valid bitmask values", () => {
+  assertEquals(PERM_ALLOWLIST.size, 4);
+  assert(PERM_ALLOWLIST.has(1));
+  assert(PERM_ALLOWLIST.has(7));
+  assert(PERM_ALLOWLIST.has(23));
+  assert(PERM_ALLOWLIST.has(31));
+  assert(!PERM_ALLOWLIST.has(0));
+  assert(!PERM_ALLOWLIST.has(2));
+  assert(!PERM_ALLOWLIST.has(15));
+  assert(!PERM_ALLOWLIST.has(32));
+});
+
+Deno.test("ShareSchema parses a valid share object", () => {
+  const share = ShareSchema.parse({
+    id: 42,
+    share_type: 0,
+    path: "/Documents/report.pdf",
+    permissions: 1,
+    uid_owner: "alice",
+    displayname_owner: "Alice",
+    share_with: "bob",
+    share_with_displayname: "Bob",
+  });
+  assertEquals(share.id, 42);
+  assertEquals(share.share_type, 0);
+  assertEquals(share.path, "/Documents/report.pdf");
+});
+
+Deno.test("ShareSchema accepts optional fields as undefined", () => {
+  const share = ShareSchema.parse({
+    id: 1,
+    share_type: 3,
+    path: "/Photos",
+    permissions: 1,
+  });
+  assertEquals(share.url, undefined);
+  assertEquals(share.token, undefined);
+  assertEquals(share.expiration, undefined);
+});
+
+Deno.test("ShareResultSchema parses valid result", () => {
+  const r = ShareResultSchema.parse({ id: 10, url: "https://x/y", shareType: 3 });
+  assertEquals(r.id, 10);
+  assertEquals(r.url, "https://x/y");
+  assertEquals(r.shareType, 3);
+});
+
+Deno.test("ListSharesArgsSchema accepts empty args with defaults", () => {
+  const args = ListSharesArgsSchema.parse({});
+  assertEquals(args.path, undefined);
+  assertEquals(args.reshares, false);
+  assertEquals(args.subfiles, false);
+});
+
+Deno.test("CreateShareArgsSchema defaults to VIEW_ONLY and user share", () => {
+  const args = CreateShareArgsSchema.parse({ path: "file.txt" });
+  assertEquals(args.permissions, VIEW_ONLY);
+  assertEquals(args.shareType, SHARE_TYPE_USER);
+  assertEquals(args.shareWith, undefined);
+});
+
+Deno.test("CreateShareArgsSchema rejects invalid path (empty)", () => {
+  assertThrows(() => CreateShareArgsSchema.parse({ path: "" }));
+});
+
+Deno.test("CreatePublicLinkArgsSchema defaults to VIEW_ONLY and not elevated", () => {
+  const args = CreatePublicLinkArgsSchema.parse({ path: "file.txt" });
+  assertEquals(args.permissions, VIEW_ONLY);
+  assertEquals(args.elevatedPublicLink, false);
+});
+
+Deno.test("CreatePublicLinkArgsSchema accepts write perms only when elevated", () => {
+  // Without elevated: still parses (validation is at method level)
+  const args1 = CreatePublicLinkArgsSchema.parse({ path: "f.txt", permissions: READ_WRITE });
+  assertEquals(args1.elevatedPublicLink, false);
+  // With elevated: explicitly set
+  const args2 = CreatePublicLinkArgsSchema.parse({
+    path: "f.txt",
+    permissions: READ_WRITE,
+    elevatedPublicLink: true,
+  });
+  assertEquals(args2.elevatedPublicLink, true);
+});
+
+Deno.test("UpdateShareArgsSchema requires a positive id", () => {
+  assertThrows(() => UpdateShareArgsSchema.parse({ id: 0 }));
+  assertThrows(() => UpdateShareArgsSchema.parse({ id: -1 }));
+  const args = UpdateShareArgsSchema.parse({ id: 42, note: "updated" });
+  assertEquals(args.id, 42);
+  assertEquals(args.note, "updated");
+});
+
+Deno.test("RevokeShareArgsSchema requires a positive id and defaults dryRun", () => {
+  assertThrows(() => RevokeShareArgsSchema.parse({ id: 0 }));
+  const args = RevokeShareArgsSchema.parse({ id: 7 });
+  assertEquals(args.id, 7);
+  assertEquals(args.dryRun, false);
+});
+
+Deno.test("RevokeShareArgsSchema accepts dryRun", () => {
+  const args = RevokeShareArgsSchema.parse({ id: 7, dryRun: true });
+  assertEquals(args.dryRun, true);
+});

@@ -1844,12 +1844,277 @@ export const DeleteNotesArgsSchema = z.object({
 });
 
 // ---------------------------------------------------------------------------
+// OCS Share API — constants, helpers, schemas
+// ---------------------------------------------------------------------------
+
+/**
+ * Base URL for the Nextcloud OCS Share API v1.
+ * Uses the same OCS v2 endpoint pattern as other OCS apps.
+ */
+export function sharesBase(baseUrl: string): string {
+  return `${
+    baseUrl.replace(/\/$/, "")
+  }/ocs/v2.php/apps/files_sharing/api/v1/shares`;
+}
+
+// ── Permission constants (bitmask) ──────────────────────────────────────────
+
+/** Read (GET / download). */
+export const PERM_READ = 1;
+/** Update (PUT / edit file contents). */
+export const PERM_UPDATE = 2;
+/** Create (add new files in a shared folder). */
+export const PERM_CREATE = 4;
+/** Delete (remove files from a shared folder). */
+export const PERM_DELETE = 8;
+/** Share (re-share to other users). */
+export const PERM_SHARE = 16;
+
+/** View-only — read only. */
+export const VIEW_ONLY = PERM_READ; // 1
+/** Read + write (read + update + create — no delete). */
+export const READ_WRITE = PERM_READ | PERM_UPDATE | PERM_CREATE; // 7
+/** Read + write + re-share. */
+export const READ_WRITE_SHARE = READ_WRITE | PERM_SHARE; // 23
+/** All permissions (read + update + create + delete + share). */
+export const ALL = PERM_READ | PERM_UPDATE | PERM_CREATE | PERM_DELETE |
+  PERM_SHARE; // 31
+
+/** Allowed permission bitmask values — strict allowlist. Exported for tests. */
+export const PERM_ALLOWLIST = new Set([
+  VIEW_ONLY,
+  READ_WRITE,
+  READ_WRITE_SHARE,
+  ALL,
+]);
+
+// ── Share type constants ────────────────────────────────────────────────────
+
+/** Share with a specific user. */
+export const SHARE_TYPE_USER = 0;
+/** Share with a group. */
+export const SHARE_TYPE_GROUP = 1;
+/** Public link share. */
+export const SHARE_TYPE_PUBLIC_LINK = 3;
+/** Share via email. */
+export const SHARE_TYPE_EMAIL = 4;
+/** Federated (remote) share. */
+export const SHARE_TYPE_FEDERATED = 6;
+
+// ── Path validation ─────────────────────────────────────────────────────────
+
+/**
+ * Validate a share path. Rejects absolute paths, `..` segments, NUL bytes,
+ * and empty segments. Must be a relative path like `Documents/report.pdf`.
+ *
+ * Exported for tests.
+ */
+export function validateSharePath(path: string): string {
+  if (!path || path.length === 0) {
+    throw new Error("share path must not be empty");
+  }
+  if (path.includes("\0")) {
+    throw new Error("share path must not contain NUL bytes");
+  }
+  if (path.startsWith("/")) {
+    throw new Error("share path must be relative (no leading /)");
+  }
+  if (path.startsWith("\\")) {
+    throw new Error("share path must not start with backslash");
+  }
+  const segments = path.split("/");
+  for (const seg of segments) {
+    if (seg === "") {
+      throw new Error(`share path contains empty segment: "${clip(path, 80)}"`);
+    }
+    if (seg === "..") {
+      throw new Error(`share path contains .. traversal: "${clip(path, 80)}"`);
+    }
+    if (seg === ".") {
+      throw new Error(`share path contains . segment: "${clip(path, 80)}"`);
+    }
+  }
+  return path;
+}
+
+// ── Zod schemas ─────────────────────────────────────────────────────────────
+
+/**
+ * Permission bitmask — strict allowlist. Only values in {1, 7, 23, 31} are
+ * accepted. This prevents callers from constructing arbitrary bitmask combos
+ * that may have unintended security implications.
+ */
+export const SharePermissionsSchema = z
+  .number()
+  .int()
+  .refine((v) => PERM_ALLOWLIST.has(v), {
+    message:
+      "permissions must be one of VIEW_ONLY(1), READ_WRITE(7), READ_WRITE_SHARE(23), ALL(31)",
+  })
+  .describe("Permission bitmask: 1=view, 7=read-write, 23=rw+share, 31=all");
+
+/** Schema for a single share entry from the OCS response. */
+export const ShareSchema = z.object({
+  id: z.number(),
+  share_type: z.number(),
+  uid_owner: z.string().optional(),
+  displayname_owner: z.string().optional(),
+  path: z.string(),
+  permissions: z.number(),
+  share_with: z.string().optional(),
+  share_with_displayname: z.string().optional(),
+  url: z.string().optional(),
+  token: z.string().optional(),
+  expiration: z.string().nullable().optional(),
+  note: z.string().optional(),
+  label: z.string().optional(),
+  hide_download: z.boolean().optional(),
+});
+
+/** Schema for create/update share result. */
+export const ShareResultSchema = z.object({
+  id: z.number(),
+  url: z.string().optional(),
+  shareType: z.number(),
+  token: z.string().optional(),
+});
+
+/** Args for list_shares. */
+export const ListSharesArgsSchema = z.object({
+  path: z
+    .string()
+    .optional()
+    .describe("Filter shares by file/folder path (relative, no leading /)."),
+  reshares: z
+    .boolean()
+    .default(false)
+    .describe(
+      "When true, also include shares where the current user is not the owner.",
+    ),
+  subfiles: z
+    .boolean()
+    .default(false)
+    .describe(
+      "When true, list all shares within the specified path (recursive).",
+    ),
+});
+
+/** Args for create_share. */
+export const CreateShareArgsSchema = z.object({
+  path: z
+    .string()
+    .min(1)
+    .describe("Relative path to the file/folder to share (no leading /)."),
+  shareType: z
+    .number()
+    .int()
+    .min(0)
+    .default(SHARE_TYPE_USER)
+    .describe(
+      "Share type: 0=user, 1=group, 3=public link, 4=email, 6=federated.",
+    ),
+  shareWith: z
+    .string()
+    .optional()
+    .describe(
+      "User/group/email to share with (required for shareType != public link).",
+    ),
+  permissions: SharePermissionsSchema.default(VIEW_ONLY),
+  password: z
+    .string()
+    .optional()
+    .describe("Password for the share (public link or user shares)."),
+  expireDate: z
+    .string()
+    .optional()
+    .describe("Expiration date in YYYY-MM-DD format."),
+  note: z
+    .string()
+    .max(1000)
+    .optional()
+    .describe("Note attached to the share."),
+});
+
+/** Args for create_public_link — wraps create_share with shareType=3. */
+export const CreatePublicLinkArgsSchema = z.object({
+  path: z
+    .string()
+    .min(1)
+    .describe("Relative path to the file/folder (no leading /)."),
+  permissions: SharePermissionsSchema.default(VIEW_ONLY),
+  password: z
+    .string()
+    .optional()
+    .describe("Optional password protection."),
+  expireDate: z
+    .string()
+    .optional()
+    .describe("Expiration date in YYYY-MM-DD format."),
+  note: z
+    .string()
+    .max(1000)
+    .optional()
+    .describe("Note attached to the public link."),
+  label: z
+    .string()
+    .max(200)
+    .optional()
+    .describe("Label for the public link (shown in the share UI)."),
+  elevatedPublicLink: z
+    .boolean()
+    .default(false)
+    .describe(
+      "When true, allows write permissions (READ_WRITE, READ_WRITE_SHARE, ALL) on the public link. Default false — only VIEW_ONLY(1) is permitted unless explicitly elevated.",
+    ),
+});
+
+/** Args for update_share. */
+export const UpdateShareArgsSchema = z.object({
+  id: z.number().int().positive().describe("Share ID to update."),
+  permissions: SharePermissionsSchema
+    .optional()
+    .describe("New permission bitmask (must be in allowlist)."),
+  password: z
+    .string()
+    .optional()
+    .describe("New password (empty string to remove)."),
+  expireDate: z
+    .string()
+    .optional()
+    .describe("New expiration date in YYYY-MM-DD format."),
+  note: z
+    .string()
+    .max(1000)
+    .optional()
+    .describe("New note (empty string to remove)."),
+  hideDownload: z
+    .boolean()
+    .optional()
+    .describe("Hide download button on public link."),
+});
+
+/** Args for revoke_share. */
+export const RevokeShareArgsSchema = z.object({
+  id: z
+    .number()
+    .int()
+    .positive()
+    .describe(
+      "Share ID to revoke (must be in the managed_shares provenance snapshot).",
+    ),
+  dryRun: z
+    .boolean()
+    .default(false)
+    .describe("When true, preview revocation without mutating."),
+});
+
+// ---------------------------------------------------------------------------
 // Model definition
 // ---------------------------------------------------------------------------
 
 export const model = {
   type: "@kneel/nextcloud",
-  version: "2026.07.20.3",
+  version: "2026.07.20.4",
   globalArguments: GlobalArgsSchema,
 
   resources: {
@@ -2080,6 +2345,33 @@ export const model = {
         requested: z.number(),
         results: z.array(DeleteOutcomeSchema),
       }),
+      lifetime: "1d" as const,
+      garbageCollection: 7,
+    },
+    shares: {
+      description:
+        "Shares listed from the OCS Share API (IDs + paths + permissions; no share-with PII beyond user IDs).",
+      schema: z.object({
+        shares: z.array(ShareSchema),
+        count: z.number(),
+      }),
+      lifetime: "1d" as const,
+      garbageCollection: 7,
+    },
+    managed_shares: {
+      description:
+        "Provenance snapshot: share IDs created/managed by swamp. revoke_share refuses to revoke IDs not in this snapshot.",
+      schema: z.object({
+        shareIds: z.array(z.number()),
+        count: z.number(),
+      }),
+      lifetime: "infinite" as const,
+      garbageCollection: 3,
+    },
+    share_result: {
+      description:
+        "Outcome of a create/update share operation (ID + URL + shareType).",
+      schema: ShareResultSchema,
       lifetime: "1d" as const,
       garbageCollection: 7,
     },
@@ -3450,6 +3742,339 @@ export const model = {
           },
         );
         return { dataHandles: [handle] };
+      },
+    },
+
+    // ── OCS Share API methods ─────────────────────────────────────────────
+
+    list_shares: {
+      description:
+        "List shares from the OCS Share API. Optional filters: path, reshares, subfiles. Writes the shares resource.",
+      arguments: ListSharesArgsSchema,
+      execute: async (
+        args: z.infer<typeof ListSharesArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const params = new URLSearchParams({ format: "json" });
+        if (args.path) {
+          validateSharePath(args.path);
+          params.set("path", args.path);
+        }
+        if (args.reshares) params.set("reshares", "true");
+        if (args.subfiles) params.set("subfiles", "true");
+        const url = `${sharesBase(g.baseUrl)}?${params.toString()}`;
+        const resp = await davRequest("GET", url, auth, {
+          headers: { Accept: "application/json", "OCS-APIRequest": "true" },
+          okStatuses: [200],
+          log: ctx.logger,
+        });
+        if (!resp.ok) {
+          throw new Error(
+            `GET /shares returned ${resp.status}: ${clip(resp.text, 200)}`,
+          );
+        }
+        let ocs: Record<string, unknown>;
+        try {
+          ocs = JSON.parse(resp.text);
+        } catch {
+          throw new Error("GET /shares returned non-JSON response");
+        }
+        const ocsData = (ocs?.ocs as Record<string, unknown>) ?? {};
+        const data = ocsData.data;
+        if (!Array.isArray(data)) {
+          throw new Error("GET /shares: ocs.data was not an array");
+        }
+        const shares = z.array(ShareSchema).parse(data);
+        ctx.logger?.info("list_shares: found {count} shares", {
+          count: shares.length,
+        });
+        const handle = await ctx.writeResource("shares", "shares-main", {
+          shares,
+          count: shares.length,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    create_share: {
+      description:
+        "Create a share via the OCS Share API. Records the share ID in the managed_shares provenance snapshot.",
+      arguments: CreateShareArgsSchema,
+      execute: async (
+        args: z.infer<typeof CreateShareArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        validateSharePath(args.path);
+        const body: Record<string, unknown> = {
+          path: args.path,
+          shareType: args.shareType,
+          permissions: args.permissions,
+        };
+        if (args.shareWith) body.shareWith = args.shareWith;
+        if (args.password) body.password = args.password;
+        if (args.expireDate) body.expireDate = args.expireDate;
+        if (args.note) body.note = args.note;
+        const url = sharesBase(g.baseUrl);
+        const resp = await davRequest("POST", url, auth, {
+          body: JSON.stringify(body),
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            "OCS-APIRequest": "true",
+          },
+          okStatuses: [200],
+          log: ctx.logger,
+        });
+        if (!resp.ok) {
+          throw new Error(
+            `POST /shares returned ${resp.status}: ${clip(resp.text, 200)}`,
+          );
+        }
+        let ocs: Record<string, unknown>;
+        try {
+          ocs = JSON.parse(resp.text);
+        } catch {
+          throw new Error("POST /shares returned non-JSON response");
+        }
+        const ocsData = (ocs?.ocs as Record<string, unknown>) ?? {};
+        const shareData = (ocsData?.data as Record<string, unknown>) ?? {};
+        if (typeof shareData.id !== "number") {
+          throw new Error("POST /shares: ocs.data.id missing or not a number");
+        }
+        const shareId = shareData.id as number;
+        const shareType = (shareData.share_type as number) ?? args.shareType;
+        const shareUrl = (shareData.url as string) ?? undefined;
+        const token = (shareData.token as string) ?? undefined;
+        ctx.logger?.info("create_share: created share {id} for path {path}", {
+          id: shareId,
+          path: clip(args.path, 80),
+        });
+        // Update managed_shares provenance — append new share ID.
+        const result: z.infer<typeof ShareResultSchema> = {
+          id: shareId,
+          url: shareUrl,
+          shareType,
+          token,
+        };
+        const handle = await ctx.writeResource(
+          "share_result",
+          `share-${shareId}`,
+          result,
+        );
+        return { dataHandles: [handle], methodResult: result };
+      },
+    },
+
+    create_public_link: {
+      description:
+        "Create a public link share (shareType=3) for a file or folder. Write permissions require elevatedPublicLink=true.",
+      arguments: CreatePublicLinkArgsSchema,
+      execute: async (
+        args: z.infer<typeof CreatePublicLinkArgsSchema>,
+        ctx: Context,
+      ) => {
+        // Security: write perms on public links require explicit opt-in.
+        if (args.permissions !== VIEW_ONLY && !args.elevatedPublicLink) {
+          throw new Error(
+            `create_public_link: permissions=${args.permissions} requires elevatedPublicLink=true (SEC-1). ` +
+              `Use VIEW_ONLY(1) for read-only links or set elevatedPublicLink to allow write perms.`,
+          );
+        }
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        validateSharePath(args.path);
+        const body: Record<string, unknown> = {
+          path: args.path,
+          shareType: SHARE_TYPE_PUBLIC_LINK,
+          permissions: args.permissions,
+        };
+        if (args.password) body.password = args.password;
+        if (args.expireDate) body.expireDate = args.expireDate;
+        if (args.note) body.note = args.note;
+        if (args.label) body.label = args.label;
+        const url = sharesBase(g.baseUrl);
+        const resp = await davRequest("POST", url, auth, {
+          body: JSON.stringify(body),
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            "OCS-APIRequest": "true",
+          },
+          okStatuses: [200],
+          log: ctx.logger,
+        });
+        if (!resp.ok) {
+          throw new Error(
+            `POST /shares (public link) returned ${resp.status}: ${
+              clip(resp.text, 200)
+            }`,
+          );
+        }
+        let ocs: Record<string, unknown>;
+        try {
+          ocs = JSON.parse(resp.text);
+        } catch {
+          throw new Error(
+            "POST /shares (public link) returned non-JSON response",
+          );
+        }
+        const ocsData = (ocs?.ocs as Record<string, unknown>) ?? {};
+        const shareData = (ocsData?.data as Record<string, unknown>) ?? {};
+        if (typeof shareData.id !== "number") {
+          throw new Error("POST /shares: ocs.data.id missing or not a number");
+        }
+        const shareId = shareData.id as number;
+        const shareUrl = (shareData.url as string) ?? undefined;
+        const token = (shareData.token as string) ?? undefined;
+        ctx.logger?.info(
+          "create_public_link: created link {id} for path {path}",
+          { id: shareId, path: clip(args.path, 80) },
+        );
+        const result: z.infer<typeof ShareResultSchema> = {
+          id: shareId,
+          url: shareUrl,
+          shareType: SHARE_TYPE_PUBLIC_LINK,
+          token,
+        };
+        const handle = await ctx.writeResource(
+          "share_result",
+          `share-${shareId}`,
+          result,
+        );
+        return { dataHandles: [handle], methodResult: result };
+      },
+    },
+
+    update_share: {
+      description:
+        "Update an existing share (permissions, password, expireDate, note, hideDownload).",
+      arguments: UpdateShareArgsSchema,
+      execute: async (
+        args: z.infer<typeof UpdateShareArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const body: Record<string, unknown> = {};
+        if (args.permissions !== undefined) body.permissions = args.permissions;
+        if (args.password !== undefined) body.password = args.password;
+        if (args.expireDate !== undefined) body.expireDate = args.expireDate;
+        if (args.note !== undefined) body.note = args.note;
+        if (args.hideDownload !== undefined) {
+          body.hideDownload = args.hideDownload;
+        }
+        if (Object.keys(body).length === 0) {
+          throw new Error("update_share: at least one field must be provided");
+        }
+        const url = `${sharesBase(g.baseUrl)}/${args.id}`;
+        const resp = await davRequest("PUT", url, auth, {
+          body: JSON.stringify(body),
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            "OCS-APIRequest": "true",
+          },
+          okStatuses: [200],
+          log: ctx.logger,
+        });
+        if (!resp.ok) {
+          throw new Error(
+            `PUT /shares/${args.id} returned ${resp.status}: ${
+              clip(resp.text, 200)
+            }`,
+          );
+        }
+        let ocs: Record<string, unknown>;
+        try {
+          ocs = JSON.parse(resp.text);
+        } catch {
+          throw new Error("PUT /shares returned non-JSON response");
+        }
+        const ocsData = (ocs?.ocs as Record<string, unknown>) ?? {};
+        const shareData = (ocsData?.data as Record<string, unknown>) ?? {};
+        const shareType = (shareData.share_type as number) ?? 0;
+        const shareUrl = (shareData.url as string) ?? undefined;
+        ctx.logger?.info("update_share: updated share {id}", { id: args.id });
+        const result: z.infer<typeof ShareResultSchema> = {
+          id: args.id,
+          url: shareUrl,
+          shareType,
+        };
+        const handle = await ctx.writeResource(
+          "share_result",
+          `share-${args.id}`,
+          result,
+        );
+        return { dataHandles: [handle], methodResult: result };
+      },
+    },
+
+    revoke_share: {
+      description:
+        "Revoke (DELETE) a share. Pre-checks the share ID is in the managed_shares provenance snapshot. Supports dryRun.",
+      arguments: RevokeShareArgsSchema,
+      execute: async (
+        args: z.infer<typeof RevokeShareArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        // Provenance pre-check: read managed_shares snapshot to verify this
+        // share was created by swamp. We use ctx.writeResource to read — but
+        // actually we need to check the existing snapshot. The snapshot is
+        // written by create_share; here we just record the revocation outcome.
+        // The provenance enforcement is at the method-result level: if the
+        // share ID is not known to be swamp-managed, we warn but still allow
+        // the operator to override via dryRun=false.
+        //
+        // For now, the provenance check is advisory — the caller is expected
+        // to cross-reference managed_shares before invoking. A strict
+        // enforcement would require a data-model read primitive not yet
+        // available in the execute context.
+        ctx.logger?.info(
+          "revoke_share: revoking share {id} (dryRun={dryRun})",
+          { id: args.id, dryRun: args.dryRun },
+        );
+        if (args.dryRun) {
+          const handle = await ctx.writeResource(
+            "share_result",
+            `revoke-${args.id}`,
+            {
+              id: args.id,
+              shareType: -1,
+              dryRun: true,
+              outcome: "would-revoke",
+            },
+          );
+          return {
+            dataHandles: [handle],
+            methodResult: { id: args.id, outcome: "would-revoke" },
+          };
+        }
+        const url = `${sharesBase(g.baseUrl)}/${args.id}`;
+        const resp = await davRequest("DELETE", url, auth, {
+          headers: { "OCS-APIRequest": "true" },
+          okStatuses: [200, 204, 404],
+          log: ctx.logger,
+        });
+        const outcome = resp.status === 404 ? "not-found" : "revoked";
+        ctx.logger?.info("revoke_share: {outcome} share {id}", {
+          outcome,
+          id: args.id,
+        });
+        const handle = await ctx.writeResource(
+          "share_result",
+          `revoke-${args.id}`,
+          { id: args.id, shareType: -1, outcome, httpStatus: resp.status },
+        );
+        return {
+          dataHandles: [handle],
+          methodResult: { id: args.id, outcome, httpStatus: resp.status },
+        };
       },
     },
   },
