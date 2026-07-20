@@ -3812,6 +3812,16 @@ export const model = {
         const g = GlobalArgsSchema.parse(ctx.globalArgs);
         const auth = basicAuth(g.username, g.appPassword);
         validateSharePath(args.path);
+        // Security: write perms on public links require explicit opt-in (SEC-3).
+        if (
+          args.shareType === SHARE_TYPE_PUBLIC_LINK &&
+          args.permissions !== VIEW_ONLY &&
+          !(args as Record<string, unknown>).elevatedPublicLink
+        ) {
+          throw new Error(
+            `create_share: shareType=3 (public link) with permissions=${args.permissions} requires elevatedPublicLink=true (SEC-3). Use VIEW_ONLY(1) for read-only links.`,
+          );
+        }
         const body: Record<string, unknown> = {
           path: args.path,
           shareType: args.shareType,
@@ -3856,6 +3866,11 @@ export const model = {
         const shareType = typeof shareTypeRaw === "string"
           ? parseInt(shareTypeRaw, 10)
           : (shareTypeRaw as number) ?? args.shareType;
+        if (isNaN(shareId) || isNaN(shareType)) {
+          throw new Error(
+            "POST /shares: ocs.data.id or share_type is not a valid number",
+          );
+        }
         const shareUrl = (shareData.url as string) ?? undefined;
         const token = (shareData.token as string | null) ?? undefined;
         ctx.logger?.info("create_share: created share {id} for path {path}", {
@@ -3874,7 +3889,13 @@ export const model = {
           `share-${shareId}`,
           result,
         );
-        return { dataHandles: [handle], methodResult: result };
+        // Track in managed_shares provenance snapshot.
+        const managedHandle = await ctx.writeResource(
+          "managed_shares",
+          "managed-shares-main",
+          { shareIds: [shareId], count: 1 },
+        );
+        return { dataHandles: [handle, managedHandle], methodResult: result };
       },
     },
 
@@ -3940,6 +3961,9 @@ export const model = {
         const shareId = typeof shareIdRaw === "string"
           ? parseInt(shareIdRaw, 10)
           : shareIdRaw as number;
+        if (isNaN(shareId)) {
+          throw new Error("POST /shares: ocs.data.id is not a valid number");
+        }
         const shareUrl = (shareData.url as string) ?? undefined;
         const token = (shareData.token as string | null) ?? undefined;
         ctx.logger?.info(
@@ -3957,7 +3981,12 @@ export const model = {
           `share-${shareId}`,
           result,
         );
-        return { dataHandles: [handle], methodResult: result };
+        const managedHandle = await ctx.writeResource(
+          "managed_shares",
+          "managed-shares-main",
+          { shareIds: [shareId], count: 1 },
+        );
+        return { dataHandles: [handle, managedHandle], methodResult: result };
       },
     },
 
