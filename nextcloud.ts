@@ -196,7 +196,7 @@ const PutEventsArgsSchema = z.object({
     ),
 });
 
-const DeleteEventsArgsSchema = z.object({
+export const DeleteEventsArgsSchema = z.object({
   calendar: z.string().min(1).describe("Target calendar name."),
   uids: z
     .array(z.string().min(1))
@@ -213,6 +213,18 @@ const DeleteEventsArgsSchema = z.object({
     .default(false)
     .describe(
       "When true, run the full existence + provenance decision for each uid but issue no DELETE. Events that would be removed are reported as 'would-delete'; nothing is mutated. A safe preview of a reconciliation delete.",
+    ),
+  maxDeletes: z
+    .number()
+    .int()
+    .min(0)
+    .default(50)
+    .describe(
+      "Blast-radius cap: if the batch has MORE than this many uids, abort the " +
+        "whole delete (mutate nothing) and report aborted=true. A reconciliation " +
+        "that suddenly wants to remove an implausible number of events is almost " +
+        "always a bug (bad window, empty/mis-wired fetch) rather than a real mass " +
+        "deletion. 0 disables the cap. Applies to dry-run too.",
     ),
 });
 
@@ -250,6 +262,116 @@ const CreateCalendarArgsSchema = z.object({
     .regex(/^#[0-9A-Fa-f]{6}$/, "color must be #RRGGBB")
     .optional()
     .describe("Calendar color as #RRGGBB."),
+});
+
+// ---------------------------------------------------------------------------
+// CardDAV method argument / contact schemas
+// ---------------------------------------------------------------------------
+
+/** Contact input schema for put_contacts. PII-minimal: only UID + FN in read-back. */
+export const ContactInputSchema = z.object({
+  uid: z
+    .string()
+    .min(1)
+    .max(200)
+    .refine((s) => !s.includes("\0"), { message: "uid must not contain NUL" })
+    .refine((s) => /^[A-Za-z0-9_\-.]{1,200}$/.test(s), {
+      message:
+        "uid must match /^[A-Za-z0-9_\\-.]{1,200}$/ (path-traversal guard, SEC-2)",
+    })
+    .describe("Contact UID — the cross-system unique upsert key."),
+  fn: z.string().min(1).describe("Formatted name (required)."),
+  n: z
+    .object({
+      family: z.string().optional(),
+      given: z.string().optional(),
+      additional: z.string().optional(),
+      prefix: z.string().optional(),
+      suffix: z.string().optional(),
+    })
+    .optional()
+    .describe("Structured name."),
+  email: z
+    .array(
+      z.object({
+        value: z.string().min(1),
+        type: z.string().optional(),
+      }),
+    )
+    .optional(),
+  tel: z
+    .array(
+      z.object({
+        value: z.string().min(1),
+        type: z.string().optional(),
+      }),
+    )
+    .optional(),
+  adr: z
+    .array(
+      z.object({
+        pobox: z.string().optional(),
+        ext: z.string().optional(),
+        street: z.string().optional(),
+        locality: z.string().optional(),
+        region: z.string().optional(),
+        code: z.string().optional(),
+        country: z.string().optional(),
+        type: z.string().optional(),
+      }),
+    )
+    .optional(),
+  org: z.string().optional(),
+  title: z.string().optional(),
+  note: z.string().optional(),
+  bday: z
+    .string()
+    .regex(/^\d{4}-?\d{2}-?\d{2}$/, "bday must be YYYY-MM-DD or YYYYMMDD")
+    .optional(),
+  url: z.string().optional(),
+  categories: z.array(z.string()).optional(),
+});
+
+const ListAddressbooksArgsSchema = z.object({});
+
+const CreateAddressbookArgsSchema = z.object({});
+
+const ListContactsArgsSchema = z.object({
+  addressbook: z.string().min(1).describe("Target addressbook name."),
+});
+
+const PutContactsArgsSchema = z.object({
+  addressbook: z.string().min(1).describe("Target addressbook name."),
+  contacts: z
+    .array(ContactInputSchema)
+    .default([])
+    .describe("Contacts to upsert (fan-out). An empty batch is a no-op."),
+});
+
+export const DeleteContactsArgsSchema = z.object({
+  addressbook: z.string().min(1).describe("Target addressbook name."),
+  uids: z
+    .array(z.string().min(1))
+    .default([])
+    .describe("Contact UIDs to delete (fan-out). An empty batch is a no-op."),
+  requireProvenance: z
+    .boolean()
+    .default(true)
+    .describe(
+      "When true (default), GET each VCard and refuse to delete any that lacks the X-SWAMP-SYNC marker.",
+    ),
+  dryRun: z
+    .boolean()
+    .default(false)
+    .describe("When true, preview deletions without mutating."),
+  maxDeletes: z
+    .number()
+    .int()
+    .min(0)
+    .default(50)
+    .describe(
+      "Blast-radius cap: if the batch has MORE than this many uids, abort the whole delete.",
+    ),
 });
 
 // ---------------------------------------------------------------------------
@@ -291,11 +413,30 @@ const DeleteOutcomeSchema = z.object({
   error: z.string().optional(),
 });
 
-/** A single event read back from a calendar — UID + DTSTART + provenance only. */
+/** A single addressbook read back from a PROPFIND. */
+const AddressbookSchema = z.object({
+  url: z.string(),
+  displayName: z.string(),
+});
+
+/** A single contact reference read back from an addressbook (no PII). */
+const ContactRefSchema = z.object({
+  uid: z.string(),
+  fn: z.string(),
+  hasProvenance: z.boolean(),
+});
+
+/** A single event read back from a calendar — UID + DTSTART + provenance + RRULE flag only. */
 const CalEventRefSchema = z.object({
   uid: z.string(),
   dtstart: z.string(),
   hasProvenance: z.boolean(),
+  isRecurring: z.boolean().describe(
+    "True if the mirror VEVENT carries an RRULE. A windowed reconciliation must " +
+      "NOT delete a recurring event on absence-from-fetch alone: gcal events.list " +
+      "and CalDAV RRULE-expansion disagree on which masters fall in a window, so a " +
+      "still-live series could be wrongly removed (ADV-2).",
+  ),
 });
 
 // ---------------------------------------------------------------------------
@@ -476,8 +617,9 @@ const PROPFIND_CALENDARS_BODY = `<?xml version="1.0" encoding="utf-8"?>
 /**
  * Body for a CalDAV `calendar-query` REPORT that returns, for every VEVENT whose
  * time-range overlaps [start, end), a partial calendar-data carrying only UID,
- * DTSTART and the provenance marker — never SUMMARY/DESCRIPTION/LOCATION, so no
- * PII is pulled. `start`/`end` are compact-UTC stamps (YYYYMMDDTHHMMSSZ).
+ * DTSTART, RRULE and the provenance marker — never SUMMARY/DESCRIPTION/LOCATION,
+ * so no PII is pulled (RRULE is structural, not PII). `start`/`end` are
+ * compact-UTC stamps (YYYYMMDDTHHMMSSZ).
  */
 export function calendarQueryBody(start: string, end: string): string {
   const s = start.replace(/[^0-9TZ]/g, "");
@@ -491,6 +633,7 @@ export function calendarQueryBody(start: string, end: string): string {
         <c:comp name="VEVENT">
           <c:prop name="UID"/>
           <c:prop name="DTSTART"/>
+          <c:prop name="RRULE"/>
           <c:prop name="${PROVENANCE_PROP}"/>
         </c:comp>
       </c:comp>
@@ -781,13 +924,15 @@ export type CalEventRef = {
   uid: string;
   dtstart: string;
   hasProvenance: boolean;
+  isRecurring: boolean;
 };
 
 /**
  * Parse a CalDAV `calendar-query` REPORT multistatus into `{uid, dtstart,
- * hasProvenance}` rows. Only UID, DTSTART and the provenance marker are read —
- * SUMMARY/DESCRIPTION/LOCATION are never extracted, so no event PII is
- * persisted. `hasProvenance` is what gates a reconciliation delete.
+ * hasProvenance, isRecurring}` rows. Only UID, DTSTART, RRULE and the provenance
+ * marker are read — SUMMARY/DESCRIPTION/LOCATION are never extracted, so no event
+ * PII is persisted. `hasProvenance` gates a reconciliation delete; `isRecurring`
+ * excludes recurring masters from window-based deletion (ADV-2).
  */
 export function parseCalendarReport(xml: string): CalEventRef[] {
   const out: CalEventRef[] = [];
@@ -801,6 +946,7 @@ export function parseCalendarReport(xml: string): CalEventRef[] {
       uid: unescapeText(uidRaw),
       dtstart: icalProp(ics, "DTSTART") ?? "",
       hasProvenance: icalProp(ics, PROVENANCE_PROP) !== null,
+      isRecurring: icalProp(ics, "RRULE") !== null,
     });
   }
   return out;
@@ -830,12 +976,367 @@ export function toCompactUtc(rfc3339: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// CardDAV — contacts / address books (parallel to the CalDAV section above)
+// ---------------------------------------------------------------------------
+
+/**
+ * Contacts provenance marker. Every VCard this model writes carries
+ * `X-SWAMP-SYNC:gcontacts-nc-sync`, so a reconciliation delete can tell a
+ * swamp-managed mirror contact apart from a foreign contact that merely
+ * shares an addressbook — foreign contacts are never deleted.
+ */
+export const CONTACTS_PROVENANCE_VALUE = "gcontacts-nc-sync";
+
+// ── CardDAV URL construction ───────────────────────────────────────────────
+
+/** URL for a single addressbook collection under the principal's addressbook home. */
+export function addressbookUrl(
+  baseUrl: string,
+  username: string,
+  addressbook: string,
+): string {
+  const slug = encodeURIComponent(addressbook.replace(/^\/+|\/+$/g, ""));
+  return `${davBase(baseUrl)}/addressbooks/users/${
+    encodeURIComponent(username)
+  }/${slug}/`;
+}
+
+/**
+ * Validate a contact UID against the SEC-2 allowlist. The UID is used in URL
+ * construction and VCard serialization; anything outside the safe charset is
+ * rejected to prevent path traversal and property injection.
+ */
+export function validateContactUid(uid: string): void {
+  if (!/^[A-Za-z0-9_\-.]{1,200}$/.test(uid)) {
+    throw new Error(
+      `contact uid rejected by allowlist: ${clip(uid, 40)}`,
+    );
+  }
+}
+
+/**
+ * Sanitize a UID for use as a filename segment. Same approach as eventHref —
+ * replace unsafe chars with `_`, cap length, append FNV-1a of the raw UID for
+ * collision resistance.
+ */
+export function sanitizeUidForPath(uid: string): string {
+  return uid.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 96);
+}
+
+/**
+ * Deterministic, filesystem-safe object name for a contact UID. The `kind`
+ * parameter selects the file extension — `.vcf` for CardDAV, `.ics` for
+ * CalDAV (ADV-4: never mix extensions).
+ */
+export function urlForUid(
+  baseUrl: string,
+  _username: string,
+  collectionPath: string,
+  uid: string,
+  kind: "vcf" | "ics",
+): string {
+  const safe = sanitizeUidForPath(uid);
+  const encoded = encodeURIComponent(`${safe}-${fnv1a(uid)}.${kind}`);
+  const base = collectionPath.endsWith("/")
+    ? collectionPath
+    : `${baseUrl.replace(/\/$/, "")}/remote.php/dav/${collectionPath}/`;
+  return `${base}${encoded}`;
+}
+
+/** Contact href in an addressbook — VCard file (.vcf, not .ics). */
+export function contactHref(
+  baseUrl: string,
+  username: string,
+  addressbook: string,
+  uid: string,
+): string {
+  return urlForUid(
+    baseUrl,
+    username,
+    `addressbooks/users/${encodeURIComponent(username)}/${
+      encodeURIComponent(addressbook)
+    }`,
+    uid,
+    "vcf",
+  );
+}
+
+// ── VCard 4.0 construction (pure function, parallels buildVcalendar) ───────
+
+/**
+ * Escape a VCard 4.0 TEXT value. RFC 6350 §3.4 defers to RFC 5545 §3.3.11 for
+ * TEXT values: same escaping rules as iCal (`\\`, `\\;`, `\\,`, `\\n`). Reuses
+ * the existing escapeText (SEC-1).
+ */
+function vcardEscapeText(value: string): string {
+  return escapeText(value);
+}
+
+/**
+ * Render an N (structured name) property value. Five semicolon-separated
+ * components, each TEXT-escaped (semicolons and commas INSIDE each component
+ * are escaped so they don't collide with the structural separators).
+ */
+function renderN(n: {
+  family?: string;
+  given?: string;
+  additional?: string;
+  prefix?: string;
+  suffix?: string;
+}): string {
+  return [
+    vcardEscapeText(n.family ?? ""),
+    vcardEscapeText(n.given ?? ""),
+    vcardEscapeText(n.additional ?? ""),
+    vcardEscapeText(n.prefix ?? ""),
+    vcardEscapeText(n.suffix ?? ""),
+  ].join(";");
+}
+
+/**
+ * Render an ADR (address) property value. Seven semicolon-separated
+ * components, each TEXT-escaped.
+ */
+function renderAdr(a: {
+  pobox?: string;
+  ext?: string;
+  street?: string;
+  locality?: string;
+  region?: string;
+  code?: string;
+  country?: string;
+}): string {
+  return [
+    vcardEscapeText(a.pobox ?? ""),
+    vcardEscapeText(a.ext ?? ""),
+    vcardEscapeText(a.street ?? ""),
+    vcardEscapeText(a.locality ?? ""),
+    vcardEscapeText(a.region ?? ""),
+    vcardEscapeText(a.code ?? ""),
+    vcardEscapeText(a.country ?? ""),
+  ].join(";");
+}
+
+/**
+ * Build a full VCard 4.0 body for the given contact. Every emitted field is
+ * escaped or charset-constrained, so no caller value can inject a VCard
+ * property even if schema validation is bypassed.
+ *
+ * Dual provenance (ADV-1): the X-SWAMP-SYNC property AND a NOTE sentinel both
+ * carry the marker, so at least one survives client normalization that strips
+ * unknown X-properties.
+ */
+export function buildVcard(
+  contact: z.infer<typeof ContactInputSchema>,
+): string {
+  // SEC-1 defense-in-depth: reject NUL in the UID even though the schema
+  // already bans control chars.
+  if (contact.uid.includes("\0")) {
+    throw new Error("contact uid contains NUL");
+  }
+  validateContactUid(contact.uid);
+  const lines: string[] = [
+    "BEGIN:VCARD",
+    "VERSION:4.0",
+    `UID:${vcardEscapeText(contact.uid)}`,
+    `FN:${vcardEscapeText(contact.fn)}`,
+  ];
+  if (contact.n) lines.push(`N:${renderN(contact.n)}`);
+  for (const e of contact.email ?? []) {
+    const type = e.type
+      ? `;TYPE=${e.type.replace(/[^A-Za-z0-9_,-]/g, "")}`
+      : "";
+    lines.push(`EMAIL${type}:${vcardEscapeText(e.value)}`);
+  }
+  for (const t of contact.tel ?? []) {
+    const type = t.type
+      ? `;TYPE=${t.type.replace(/[^A-Za-z0-9_,-]/g, "")}`
+      : "";
+    lines.push(`TEL${type}:${vcardEscapeText(t.value)}`);
+  }
+  for (const a of contact.adr ?? []) {
+    const type = a.type
+      ? `;TYPE=${a.type.replace(/[^A-Za-z0-9_,-]/g, "")}`
+      : "";
+    lines.push(`ADR${type}:${renderAdr(a)}`);
+  }
+  if (contact.org) lines.push(`ORG:${vcardEscapeText(contact.org)}`);
+  if (contact.title) lines.push(`TITLE:${vcardEscapeText(contact.title)}`);
+  if (contact.note) lines.push(`NOTE:${vcardEscapeText(contact.note)}`);
+  if (contact.bday) {
+    // SEC: strip non-digits and dashes (injection-safe for VALUE=DATE).
+    lines.push(`BDAY:${contact.bday.replace(/[^0-9-]/g, "")}`);
+  }
+  if (contact.url) lines.push(`URL:${vcardEscapeText(contact.url)}`);
+  if (contact.categories?.length) {
+    lines.push(
+      `CATEGORIES:${contact.categories.map(vcardEscapeText).join(",")}`,
+    );
+  }
+  // Provenance — dual stamp (X-property + NOTE sentinel, ADV-1).
+  lines.push(`${PROVENANCE_PROP}:${CONTACTS_PROVENANCE_VALUE}`);
+  lines.push(`NOTE:Swamp-managed contact (${CONTACTS_PROVENANCE_VALUE})`);
+  lines.push("END:VCARD");
+  return lines.map(foldLine).join("\r\n") + "\r\n";
+}
+
+// ── VCard reading (minimal, pure function) ─────────────────────────────────
+
+/**
+ * Read a single VCard property value. Unfolds continuation lines first,
+ * tolerates property parameters (`;TYPE=WORK`), and is case-insensitive on
+ * the property name. Returns the raw (still-escaped) value.
+ */
+export function vcardProp(vcf: string, prop: string): string | null {
+  const unfolded = vcf.replace(/\r\n[ \t]/g, "").replace(/\n[ \t]/g, "");
+  const re = new RegExp(
+    `(?:^|\\n)${prop}(?:;[^:\\n]*)?:([^\\n\\r]*)`,
+    "i",
+  );
+  const m = re.exec(unfolded);
+  return m ? m[1].trim() : null;
+}
+
+/**
+ * All values of a possibly-repeated VCard property (e.g. NOTE). Returns raw
+ * escaped values in document order.
+ */
+export function vcardPropAll(vcf: string, prop: string): string[] {
+  const unfolded = vcf.replace(/\r\n[ \t]/g, "").replace(/\n[ \t]/g, "");
+  const results: string[] = [];
+  const re = new RegExp(
+    `(?:^|\\n)${prop}(?:;[^:\\n]*)?:([^\\n\\r]*)`,
+    "gi",
+  );
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(unfolded)) !== null) results.push(m[1].trim());
+  return results;
+}
+
+/**
+ * True if a VCard body carries this model's provenance — either the X-property
+ * with the exact expected value OR the NOTE sentinel substring (ADV-1).
+ */
+export function vcfHasProvenance(vcf: string): boolean {
+  const propVal = vcardProp(vcf, PROVENANCE_PROP);
+  if (propVal === CONTACTS_PROVENANCE_VALUE) return true;
+  const notes = vcardPropAll(vcf, "NOTE");
+  return notes.some((n) =>
+    unescapeText(n).includes(
+      `Swamp-managed contact (${CONTACTS_PROVENANCE_VALUE})`,
+    )
+  );
+}
+
+/** A minimal contact reference read back from an addressbook (no PII). */
+export type CardContactRef = {
+  uid: string;
+  fn: string;
+  hasProvenance: boolean;
+};
+
+/**
+ * Parse a single VCard body into a minimal contact reference. Only UID, FN
+ * and the provenance flag are extracted — no emails, phones, addresses, or
+ * other PII is persisted.
+ */
+export function parseVcardMinimal(vcf: string): CardContactRef | null {
+  const uidRaw = vcardProp(vcf, "UID");
+  if (!uidRaw) return null;
+  return {
+    uid: unescapeText(uidRaw),
+    fn: unescapeText(vcardProp(vcf, "FN") ?? ""),
+    hasProvenance: vcfHasProvenance(vcf),
+  };
+}
+
+// ── CardDAV XML request bodies ─────────────────────────────────────────────
+
+const PROPFIND_ADDRESSBOOKS_BODY = `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+  <d:prop>
+    <d:displayname/>
+    <d:resourcetype/>
+  </d:prop>
+</d:propfind>`;
+
+/**
+ * Body for MKCOL to create an addressbook collection. `displayName` is
+ * XML-escaped.
+ */
+export function mkAddressbookBody(displayName: string): string {
+  return `<?xml version="1.0" encoding="utf-8"?>
+<d:mkcol xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+  <d:set>
+    <d:prop>
+      <d:resourcetype><d:collection/><card:addressbook/></d:resourcetype>
+      <d:displayname>${xmlEscape(displayName)}</d:displayname>
+    </d:prop>
+  </d:set>
+</d:mkcol>`;
+}
+
+/** Parse an addressbooks PROPFIND multistatus into safe Addressbook rows. */
+export function parseAddressbooks(
+  xml: string,
+): z.infer<typeof AddressbookSchema>[] {
+  const out: z.infer<typeof AddressbookSchema>[] = [];
+  for (const resp of extractAll(xml, "response")) {
+    const resourcetype = extractFirst(resp, "resourcetype") ?? "";
+    if (!hasElement(resourcetype, "addressbook")) continue;
+    const href = extractFirst(resp, "href");
+    if (!href) continue;
+    const displayName =
+      sanitizeXmlText(extractFirst(resp, "displayname") ?? "") || href;
+    out.push({ url: href, displayName });
+  }
+  return out;
+}
+
+/**
+ * Body for a CardDAV `addressbook-query` REPORT that returns, for every
+ * VCard in the addressbook, a partial address-data carrying only UID, FN and
+ * the provenance marker — never EMAIL/TEL/ADR, so no PII is pulled.
+ */
+export function addressbookQueryBody(): string {
+  return `<?xml version="1.0" encoding="utf-8"?>
+<card:addressbook-query xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+  <d:prop>
+    <d:getetag/>
+    <card:address-data>
+      <card:prop name="UID"/>
+      <card:prop name="FN"/>
+      <card:prop name="${PROVENANCE_PROP}"/>
+      <card:prop name="NOTE"/>
+    </card:address-data>
+  </d:prop>
+</card:addressbook-query>`;
+}
+
+/**
+ * Parse a CardDAV `addressbook-query` REPORT multistatus into minimal contact
+ * rows. Only UID, FN and the provenance flag are extracted — no contact PII
+ * (EMAIL/TEL/ADR) is persisted.
+ */
+export function parseAddressbookReport(xml: string): CardContactRef[] {
+  const out: CardContactRef[] = [];
+  for (const resp of extractAll(xml, "response")) {
+    const raw = extractFirst(resp, "address-data");
+    if (!raw) continue;
+    const vcf = decodeXmlEntities(raw);
+    const ref = parseVcardMinimal(vcf);
+    if (ref) out.push(ref);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Model definition
 // ---------------------------------------------------------------------------
 
 export const model = {
   type: "@kneel/nextcloud",
-  version: "2026.07.17.1",
+  version: "2026.07.20.1",
   globalArguments: GlobalArgsSchema,
 
   resources: {
@@ -875,6 +1376,13 @@ export const model = {
         wouldDelete: z.number(),
         skipped: z.number(),
         failed: z.number(),
+        aborted: z.boolean().describe(
+          "True when the maxDeletes blast-radius cap tripped and nothing was deleted.",
+        ),
+        abortReason: z.string().optional(),
+        requested: z.number().describe(
+          "Number of uids in the requested batch.",
+        ),
         results: z.array(DeleteOutcomeSchema),
       }),
       lifetime: "1d" as const,
@@ -902,6 +1410,66 @@ export const model = {
       }),
       lifetime: "infinite" as const,
       garbageCollection: 3,
+    },
+    addressbooks: {
+      description: "Addressbooks in the user's addressbook home.",
+      schema: z.object({
+        addressbooks: z.array(AddressbookSchema),
+        count: z.number(),
+      }),
+      lifetime: "1h" as const,
+      garbageCollection: 5,
+    },
+    provision_addressbook: {
+      description: "Outcome of an addressbook provisioning (MKCOL) request.",
+      schema: z.object({
+        addressbook: z.string(),
+        created: z.boolean(),
+        httpStatus: z.number(),
+      }),
+      lifetime: "infinite" as const,
+      garbageCollection: 3,
+    },
+    contacts: {
+      description:
+        "Contacts read back from an addressbook (UID + FN + provenance flag only, no PII).",
+      schema: z.object({
+        addressbook: z.string(),
+        contacts: z.array(ContactRefSchema),
+        count: z.number(),
+      }),
+      lifetime: "1d" as const,
+      garbageCollection: 7,
+    },
+    upsert_contacts: {
+      description:
+        "Outcome of a contact upsert batch (UIDs + outcomes only, no PII).",
+      schema: z.object({
+        addressbook: z.string(),
+        upserted: z.number(),
+        failed: z.number(),
+        results: z.array(UpsertOutcomeSchema),
+      }),
+      lifetime: "1d" as const,
+      garbageCollection: 7,
+    },
+    deletions_contacts: {
+      description:
+        "Outcome of a contact deletion batch (UIDs + outcomes only).",
+      schema: z.object({
+        addressbook: z.string(),
+        dryRun: z.boolean(),
+        deleted: z.number(),
+        wouldDelete: z.number(),
+        skipped: z.number(),
+        failed: z.number(),
+        aborted: z.boolean(),
+        abortReason: z.string().optional(),
+        requested: z.number(),
+        results: z.array(DeleteOutcomeSchema),
+      }),
+      lifetime: "1d" as const,
+      garbageCollection: 7,
     },
   },
 
@@ -1004,13 +1572,17 @@ export const model = {
           "Read {count} events from {calendar} ({withProv} swamp-stamped)",
           { count: events.length, calendar: args.calendar, withProv },
         );
-        const handle = await ctx.writeResource("events", `events-${args.calendar}`, {
-          calendar: args.calendar,
-          timeMin: args.timeMin,
-          timeMax: args.timeMax,
-          events,
-          count: events.length,
-        });
+        const handle = await ctx.writeResource(
+          "events",
+          `events-${args.calendar}`,
+          {
+            calendar: args.calendar,
+            timeMin: args.timeMin,
+            timeMax: args.timeMax,
+            events,
+            count: events.length,
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -1034,6 +1606,7 @@ export const model = {
         // not allowed on an existing resource). Treat as an idempotent no-op.
         const resp = await davRequest("MKCALENDAR", url, auth, {
           headers: { "Content-Type": "application/xml; charset=utf-8" },
+          body,
           okStatuses: [201, 405],
           log: ctx.logger,
         });
@@ -1044,11 +1617,15 @@ export const model = {
             : "Calendar {calendar} already exists",
           { calendar: args.calendar },
         );
-        const handle = await ctx.writeResource("provision", `provision-${args.calendar}`, {
-          calendar: args.calendar,
-          created,
-          httpStatus: resp.status,
-        });
+        const handle = await ctx.writeResource(
+          "provision",
+          `provision-${args.calendar}`,
+          {
+            calendar: args.calendar,
+            created,
+            httpStatus: resp.status,
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -1100,12 +1677,16 @@ export const model = {
             failed,
           },
         );
-        const handle = await ctx.writeResource("upsert", `upsert-${args.calendar}`, {
-          calendar: args.calendar,
-          upserted: results.length - failed,
-          failed,
-          results,
-        });
+        const handle = await ctx.writeResource(
+          "upsert",
+          `upsert-${args.calendar}`,
+          {
+            calendar: args.calendar,
+            upserted: results.length - failed,
+            failed,
+            results,
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -1121,6 +1702,41 @@ export const model = {
         const g = GlobalArgsSchema.parse(ctx.globalArgs);
         const auth = basicAuth(g.username, g.appPassword);
         const results: z.infer<typeof DeleteOutcomeSchema>[] = [];
+
+        // Blast-radius cap (defense in depth): an implausibly large delete batch
+        // is aborted wholesale before any DELETE is issued. Guards against a
+        // reconciliation that over-computes its delete set (bad/empty fetch,
+        // window divergence) — mutate nothing and report it loudly.
+        if (args.maxDeletes > 0 && args.uids.length > args.maxDeletes) {
+          const abortReason =
+            `refusing to delete ${args.uids.length} events from ${args.calendar}: ` +
+            `exceeds maxDeletes=${args.maxDeletes} blast-radius cap`;
+          ctx.logger?.info(
+            "delete_events ABORTED: {requested} uids exceed maxDeletes={cap} on {calendar}; nothing deleted",
+            {
+              requested: args.uids.length,
+              cap: args.maxDeletes,
+              calendar: args.calendar,
+            },
+          );
+          const handle = await ctx.writeResource(
+            "deletions",
+            `deletions-${args.calendar}`,
+            {
+              calendar: args.calendar,
+              dryRun: args.dryRun,
+              deleted: 0,
+              wouldDelete: 0,
+              skipped: 0,
+              failed: 0,
+              aborted: true,
+              abortReason,
+              requested: args.uids.length,
+              results: [],
+            },
+          );
+          return { dataHandles: [handle] };
+        }
 
         for (const uid of args.uids) {
           const href = eventHref(g.baseUrl, g.username, args.calendar, uid);
@@ -1203,15 +1819,338 @@ export const model = {
             failed,
           },
         );
-        const handle = await ctx.writeResource("deletions", `deletions-${args.calendar}`, {
-          calendar: args.calendar,
-          dryRun: args.dryRun,
-          deleted,
-          wouldDelete,
-          skipped,
-          failed,
-          results,
+        const handle = await ctx.writeResource(
+          "deletions",
+          `deletions-${args.calendar}`,
+          {
+            calendar: args.calendar,
+            dryRun: args.dryRun,
+            deleted,
+            wouldDelete,
+            skipped,
+            failed,
+            aborted: false,
+            requested: args.uids.length,
+            results,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    // ── CardDAV methods ───────────────────────────────────────────────────
+
+    list_addressbooks: {
+      description:
+        "List addressbooks in the user's addressbook home via PROPFIND.",
+      arguments: ListAddressbooksArgsSchema,
+      execute: async (
+        _args: z.infer<typeof ListAddressbooksArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const url = `${davBase(g.baseUrl)}/addressbooks/users/${
+          encodeURIComponent(g.username)
+        }/`;
+        const resp = await davRequest("PROPFIND", url, auth, {
+          headers: {
+            "Content-Type": "application/xml; charset=utf-8",
+            Depth: "1",
+          },
+          body: PROPFIND_ADDRESSBOOKS_BODY,
+          log: ctx.logger,
         });
+        const addressbooks = parseAddressbooks(resp.text);
+        ctx.logger?.info("Found {count} addressbooks", {
+          count: addressbooks.length,
+        });
+        const handle = await ctx.writeResource("addressbooks", "main", {
+          addressbooks,
+          count: addressbooks.length,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    create_addressbook: {
+      description:
+        "Provision the gcontacts-sync addressbook collection via MKCOL (idempotent).",
+      arguments: CreateAddressbookArgsSchema,
+      execute: async (
+        _args: z.infer<typeof CreateAddressbookArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const name = "gcontacts-sync";
+        const url = addressbookUrl(g.baseUrl, g.username, name);
+        const body = mkAddressbookBody("Google Contacts Sync");
+        const resp = await davRequest("MKCOL", url, auth, {
+          headers: { "Content-Type": "application/xml; charset=utf-8" },
+          body,
+          okStatuses: [201, 405],
+          log: ctx.logger,
+        });
+        const created = resp.status === 201;
+        ctx.logger?.info(
+          created
+            ? "Created addressbook {addressbook}"
+            : "Addressbook {addressbook} already exists",
+          { addressbook: name },
+        );
+        const handle = await ctx.writeResource(
+          "provision_addressbook",
+          `provision-${name}`,
+          { addressbook: name, created, httpStatus: resp.status },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    list_contacts: {
+      description:
+        "List contacts in an addressbook via a CardDAV addressbook-query REPORT. Returns UID + FN + provenance flag only (no PII).",
+      arguments: ListContactsArgsSchema,
+      execute: async (
+        args: z.infer<typeof ListContactsArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const url = addressbookUrl(g.baseUrl, g.username, args.addressbook);
+        const body = addressbookQueryBody();
+        const resp = await davRequest("REPORT", url, auth, {
+          headers: {
+            "Content-Type": "application/xml; charset=utf-8",
+            Depth: "1",
+          },
+          body,
+          log: ctx.logger,
+        });
+        const contacts = parseAddressbookReport(resp.text);
+        const withProv = contacts.filter((c) => c.hasProvenance).length;
+        ctx.logger?.info(
+          "Read {count} contacts from {addressbook} ({withProv} swamp-stamped)",
+          { count: contacts.length, addressbook: args.addressbook, withProv },
+        );
+        const handle = await ctx.writeResource(
+          "contacts",
+          `contacts-${args.addressbook}`,
+          {
+            addressbook: args.addressbook,
+            contacts,
+            count: contacts.length,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    put_contacts: {
+      description:
+        "Upsert contacts (VCards keyed by UID) into an addressbook via CardDAV PUT. Fan-out: one dispatch handles the whole batch.",
+      arguments: PutContactsArgsSchema,
+      execute: async (
+        args: z.infer<typeof PutContactsArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const results: z.infer<typeof UpsertOutcomeSchema>[] = [];
+
+        for (const contact of args.contacts) {
+          try {
+            validateContactUid(contact.uid);
+            const href = contactHref(
+              g.baseUrl,
+              g.username,
+              args.addressbook,
+              contact.uid,
+            );
+            const body = buildVcard(contact);
+            const resp = await davRequest("PUT", href, auth, {
+              headers: { "Content-Type": "text/vcard; charset=utf-8" },
+              body,
+              okStatuses: [200, 201, 204],
+              log: ctx.logger,
+            });
+            results.push({
+              uid: contact.uid,
+              outcome: resp.status === 201 ? "created" : "updated",
+              httpStatus: resp.status,
+            });
+          } catch (e) {
+            results.push({
+              uid: contact.uid,
+              outcome: "failed",
+              httpStatus: 0,
+              error: clip(e instanceof Error ? e.message : String(e)),
+            });
+          }
+        }
+
+        const failed = results.filter((r) => r.outcome === "failed").length;
+        ctx.logger?.info(
+          "Upserted {ok}/{total} contacts into {addressbook} ({failed} failed)",
+          {
+            ok: results.length - failed,
+            total: results.length,
+            addressbook: args.addressbook,
+            failed,
+          },
+        );
+        const handle = await ctx.writeResource(
+          "upsert_contacts",
+          `upsert-${args.addressbook}`,
+          {
+            addressbook: args.addressbook,
+            upserted: results.length - failed,
+            failed,
+            results,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    delete_contacts: {
+      description:
+        "Delete contacts by UID from an addressbook via CardDAV DELETE. Verifies provenance first; fan-out over the batch.",
+      arguments: DeleteContactsArgsSchema,
+      execute: async (
+        args: z.infer<typeof DeleteContactsArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const results: z.infer<typeof DeleteOutcomeSchema>[] = [];
+
+        if (args.maxDeletes > 0 && args.uids.length > args.maxDeletes) {
+          const abortReason =
+            `refusing to delete ${args.uids.length} contacts from ${args.addressbook}: ` +
+            `exceeds maxDeletes=${args.maxDeletes} blast-radius cap`;
+          ctx.logger?.info(
+            "delete_contacts ABORTED: {requested} uids exceed maxDeletes={cap} on {addressbook}",
+            {
+              requested: args.uids.length,
+              cap: args.maxDeletes,
+              addressbook: args.addressbook,
+            },
+          );
+          const handle = await ctx.writeResource(
+            "deletions_contacts",
+            `deletions-${args.addressbook}`,
+            {
+              addressbook: args.addressbook,
+              dryRun: args.dryRun,
+              deleted: 0,
+              wouldDelete: 0,
+              skipped: 0,
+              failed: 0,
+              aborted: true,
+              abortReason,
+              requested: args.uids.length,
+              results: [],
+            },
+          );
+          return { dataHandles: [handle] };
+        }
+
+        for (const uid of args.uids) {
+          validateContactUid(uid);
+          const href = contactHref(
+            g.baseUrl,
+            g.username,
+            args.addressbook,
+            uid,
+          );
+          try {
+            if (args.requireProvenance) {
+              const get = await davRequest("GET", href, auth, {
+                okStatuses: [200, 404],
+                log: ctx.logger,
+              });
+              if (get.status === 404) {
+                results.push({ uid, outcome: "not-found", httpStatus: 404 });
+                continue;
+              }
+              if (!vcfHasProvenance(get.text)) {
+                results.push({
+                  uid,
+                  outcome: "skipped",
+                  httpStatus: get.status,
+                  error:
+                    "refusing to delete: contact lacks the X-SWAMP-SYNC provenance marker",
+                });
+                continue;
+              }
+            } else {
+              const head = await davRequest("HEAD", href, auth, {
+                okStatuses: [404, 405],
+                log: ctx.logger,
+              });
+              if (head.status === 404) {
+                results.push({ uid, outcome: "not-found", httpStatus: 404 });
+                continue;
+              }
+            }
+            if (args.dryRun) {
+              results.push({ uid, outcome: "would-delete", httpStatus: 200 });
+              continue;
+            }
+            const del = await davRequest("DELETE", href, auth, {
+              okStatuses: [200, 204, 404],
+              log: ctx.logger,
+            });
+            results.push({
+              uid,
+              outcome: del.status === 404 ? "not-found" : "deleted",
+              httpStatus: del.status,
+            });
+          } catch (e) {
+            results.push({
+              uid,
+              outcome: "failed",
+              httpStatus: 0,
+              error: clip(e instanceof Error ? e.message : String(e)),
+            });
+          }
+        }
+
+        const failed = results.filter((r) => r.outcome === "failed").length;
+        const deleted = results.filter((r) => r.outcome === "deleted").length;
+        const wouldDelete =
+          results.filter((r) => r.outcome === "would-delete").length;
+        const skipped = results.filter((r) => r.outcome === "skipped").length;
+        ctx.logger?.info(
+          args.dryRun
+            ? "Dry-run: would delete {wouldDelete} of {total} from {addressbook} ({skipped} skipped, {failed} failed)"
+            : "Deleted {deleted} contacts from {addressbook} ({skipped} skipped, {failed} failed)",
+          {
+            deleted,
+            wouldDelete,
+            total: results.length,
+            addressbook: args.addressbook,
+            skipped,
+            failed,
+          },
+        );
+        const handle = await ctx.writeResource(
+          "deletions_contacts",
+          `deletions-${args.addressbook}`,
+          {
+            addressbook: args.addressbook,
+            dryRun: args.dryRun,
+            deleted,
+            wouldDelete,
+            skipped,
+            failed,
+            aborted: false,
+            requested: args.uids.length,
+            results,
+          },
+        );
         return { dataHandles: [handle] };
       },
     },

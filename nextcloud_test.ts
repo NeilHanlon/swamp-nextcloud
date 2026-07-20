@@ -1,13 +1,20 @@
 import { assert, assertEquals, assertThrows } from "jsr:@std/assert@1";
 import {
+  addressbookQueryBody,
+  addressbookUrl,
   basicAuth,
   buildVcalendar,
+  buildVcard,
   calendarQueryBody,
   calendarUrl,
   clip,
   compactDate,
+  ContactInputSchema,
+  CONTACTS_PROVENANCE_VALUE,
   davBase,
   decodeXmlEntities,
+  DeleteContactsArgsSchema,
+  DeleteEventsArgsSchema,
   escapeText,
   EventInputSchema,
   eventHref,
@@ -21,17 +28,26 @@ import {
   hasZone,
   icalProp,
   icsHasProvenance,
+  mkAddressbookBody,
   mkcalendarBody,
   ocsBase,
   octetLength,
+  parseAddressbookReport,
+  parseAddressbooks,
   parseCalendarReport,
   parseCalendars,
+  parseVcardMinimal,
   PROVENANCE_PROP,
   renderDtLine,
   safePath,
+  sanitizeUidForPath,
   toCompactUtc,
   unescapeText,
   utcStamp,
+  validateContactUid,
+  vcardProp,
+  vcardPropAll,
+  vcfHasProvenance,
   wallClockInZone,
   xmlEscape,
 } from "./nextcloud.ts";
@@ -498,27 +514,60 @@ END:VEVENT
 END:VCALENDAR</cal:calendar-data>
     </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
   </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/calendars/neil/gcal-sync/weekly.ics</d:href>
+    <d:propstat><d:prop>
+      <cal:calendar-data>BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:weekly@google.com
+DTSTART;TZID=America/New_York:20260107T100000
+RRULE:FREQ=WEEKLY;BYDAY=TU
+X-SWAMP-SYNC:gcal-nc-sync
+END:VEVENT
+END:VCALENDAR</cal:calendar-data>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
 </d:multistatus>`;
 
-Deno.test("parseCalendarReport extracts uid/dtstart/provenance, no PII", () => {
+Deno.test("parseCalendarReport extracts uid/dtstart/provenance/isRecurring, no PII", () => {
   const rows = parseCalendarReport(REPORT_FIXTURE);
-  assertEquals(rows.length, 2);
+  assertEquals(rows.length, 3);
   const stamped = rows.find((r) => r.uid === "stamped@google.com")!;
   assertEquals(stamped.dtstart, "20260115T090000Z");
   assertEquals(stamped.hasProvenance, true);
+  assertEquals(stamped.isRecurring, false);
   const foreign = rows.find((r) => r.uid === "foreign@example.com")!;
   assertEquals(foreign.hasProvenance, false);
+  assertEquals(foreign.isRecurring, false);
+  // A recurring master is flagged so window reconciliation never deletes it (ADV-2).
+  const weekly = rows.find((r) => r.uid === "weekly@google.com")!;
+  assertEquals(weekly.hasProvenance, true);
+  assertEquals(weekly.isRecurring, true);
 });
 
 // ── request-body builders ───────────────────────────────────────────────────
 
-Deno.test("calendarQueryBody embeds a sanitized time-range and requests the marker", () => {
+Deno.test("calendarQueryBody embeds a sanitized time-range and requests marker + RRULE", () => {
   const body = calendarQueryBody("20260101T000000Z", "20260201T000000Z");
   assert(body.includes(`start="20260101T000000Z"`));
   assert(body.includes(`end="20260201T000000Z"`));
   assert(body.includes(`<c:prop name="${PROVENANCE_PROP}"/>`));
+  // RRULE is requested so the read side can flag recurring masters (ADV-2).
+  assert(body.includes(`<c:prop name="RRULE"/>`));
   // No SUMMARY/DESCRIPTION requested → server returns no PII.
   assert(!body.includes("SUMMARY"));
+});
+
+Deno.test("DeleteEventsArgsSchema defaults maxDeletes to a conservative cap", () => {
+  const parsed = DeleteEventsArgsSchema.parse({ calendar: "gcal-sync" });
+  assertEquals(parsed.maxDeletes, 50);
+  assertEquals(parsed.requireProvenance, true);
+  assertEquals(parsed.dryRun, false);
+  // 0 disables the cap; explicit overrides pass through.
+  assertEquals(
+    DeleteEventsArgsSchema.parse({ calendar: "c", maxDeletes: 0 }).maxDeletes,
+    0,
+  );
 });
 
 Deno.test("toCompactUtc normalizes an RFC3339 bound and rejects garbage", () => {
@@ -536,4 +585,321 @@ Deno.test("mkcalendarBody escapes displayname and includes color when given", ()
 
 Deno.test("xmlEscape escapes the XML metacharacters", () => {
   assertEquals(xmlEscape(`a&b<c>d"e`), "a&amp;b&lt;c&gt;d&quot;e");
+});
+
+// ── CardDAV: URL construction + UID validation ──────────────────────────────
+
+Deno.test("addressbookUrl encodes user + addressbook and trims slashes", () => {
+  assertEquals(
+    addressbookUrl("https://cloud.example.com", "alice", "/gcontacts-sync/"),
+    "https://cloud.example.com/remote.php/dav/addressbooks/users/alice/gcontacts-sync/",
+  );
+});
+
+Deno.test("validateContactUid accepts safe UIDs and rejects path traversal", () => {
+  validateContactUid("abc123");
+  validateContactUid("a-b.c_d");
+  assertThrows(() => validateContactUid("../admin"));
+  assertThrows(() => validateContactUid("a?query"));
+  assertThrows(() => validateContactUid("a b"));
+  assertThrows(() => validateContactUid(""));
+  assertThrows(() => validateContactUid("a".repeat(201)));
+});
+
+Deno.test("sanitizeUidForPath replaces unsafe chars and caps length", () => {
+  assertEquals(sanitizeUidForPath("a/b\\c"), "a_b_c");
+  assertEquals(sanitizeUidForPath("x".repeat(300)).length, 96);
+});
+
+// ── CardDAV: VCard 4.0 serializer ──────────────────────────────────────────
+
+Deno.test("buildVcard emits a well-formed VCard 4.0 with all fields", () => {
+  const vcf = buildVcard({
+    uid: "contact-1",
+    fn: "Doe, John",
+    n: { family: "Doe", given: "John", additional: "Q", prefix: "Mr", suffix: "Jr" },
+    email: [{ value: "john@example.com", type: "WORK" }],
+    tel: [{ value: "+1-555-0100", type: "CELL" }],
+    adr: [{ street: "123 Main St", locality: "Springfield", region: "IL", code: "62701", country: "US", type: "HOME" }],
+    org: "Acme; Corp",
+    title: "Engineer, Sr",
+    note: "A note",
+    bday: "1990-01-15",
+    url: "https://example.com",
+    categories: ["work", "vip"],
+  });
+  assert(vcf.startsWith("BEGIN:VCARD\r\n"));
+  assert(vcf.trimEnd().endsWith("END:VCARD"));
+  assert(vcf.includes("VERSION:4.0\r\n"));
+  assert(vcf.includes("UID:contact-1\r\n"));
+  assert(vcf.includes("FN:Doe\\, John\r\n"));
+  assert(vcf.includes("N:Doe;John;Q;Mr;Jr\r\n"));
+  assert(vcf.includes("EMAIL;TYPE=WORK:john@example.com\r\n"));
+  assert(vcf.includes("TEL;TYPE=CELL:+1-555-0100\r\n"));
+  assert(vcf.includes("ORG:Acme\\; Corp\r\n"));
+  assert(vcf.includes("TITLE:Engineer\\, Sr\r\n"));
+  assert(vcf.includes("NOTE:A note\r\n"));
+  assert(vcf.includes("BDAY:1990-01-15\r\n"));
+  assert(vcf.includes("URL:https://example.com\r\n"));
+  assert(vcf.includes("CATEGORIES:work,vip\r\n"));
+  // Dual provenance (ADV-1)
+  assert(vcf.includes("X-SWAMP-SYNC:gcontacts-nc-sync\r\n"));
+  assert(vcf.includes("NOTE:Swamp-managed contact (gcontacts-nc-sync)\r\n"));
+});
+
+Deno.test("buildVcard rejects a UID with path traversal (SEC-2)", () => {
+  assertThrows(() =>
+    buildVcard({ uid: "../admin", fn: "Evil" })
+  );
+});
+
+Deno.test("buildVcard rejects a UID with spaces or query chars", () => {
+  assertThrows(() =>
+    buildVcard({ uid: "a b", fn: "Spacy" })
+  );
+  assertThrows(() =>
+    buildVcard({ uid: "a?query", fn: "Q" })
+  );
+});
+
+Deno.test("buildVcard escapes raw CRLF and bare LF in text fields (SEC-1)", () => {
+  const vcf = buildVcard({
+    uid: "c1",
+    fn: "line1\r\nline2\nline3",
+  });
+  assert(!vcf.includes("FN:line1\r\nline2"));
+  assert(vcf.includes("FN:line1\\nline2\\nline3\r\n"));
+});
+
+Deno.test("buildVcard escapes trailing backslash", () => {
+  const vcf = buildVcard({ uid: "c1", fn: "ends\\" });
+  assert(vcf.includes("FN:ends\\\\\r\n"));
+});
+
+Deno.test("buildVcard embeds BEGIN:VCARD in FN without injecting a new component", () => {
+  const vcf = buildVcard({
+    uid: "c1",
+    fn: "BEGIN:VCARD\r\nFN:injected",
+  });
+  // The injected text is escaped, so it can't start a real VCARD component.
+  const vcardLines = vcf.split("\r\n");
+  const beginCount = vcardLines.filter((l) => l === "BEGIN:VCARD").length;
+  assertEquals(beginCount, 1, "only one BEGIN:VCARD allowed");
+});
+
+Deno.test("buildVcard rejects NUL in UID (SEC-1 defense in depth)", () => {
+  assertThrows(() =>
+    buildVcard({ uid: "a\0b", fn: "Nul" })
+  );
+});
+
+// ── CardDAV: VCard parser ──────────────────────────────────────────────────
+
+Deno.test("vcardProp reads values, tolerating params and folding", () => {
+  const vcf = "BEGIN:VCARD\r\nUID:abc@contacts\r\n .gmail.com\r\nFN:John Doe\r\nTEL;TYPE=WORK:555\r\nEND:VCARD";
+  assertEquals(vcardProp(vcf, "UID"), "abc@contacts.gmail.com");
+  assertEquals(vcardProp(vcf, "FN"), "John Doe");
+  assertEquals(vcardProp(vcf, "TEL"), "555");
+  assertEquals(vcardProp(vcf, "EMAIL"), null);
+});
+
+Deno.test("vcardPropAll returns multiple NOTE values", () => {
+  const vcf = "BEGIN:VCARD\r\nNOTE:first\r\nNOTE:second\r\nEND:VCARD";
+  assertEquals(vcardPropAll(vcf, "NOTE"), ["first", "second"]);
+});
+
+Deno.test("vcfHasProvenance checks exact value, not just presence (ADV-3)", () => {
+  const stamped = "BEGIN:VCARD\r\nUID:x\r\nX-SWAMP-SYNC:gcontacts-nc-sync\r\nEND:VCARD";
+  const empty = "BEGIN:VCARD\r\nUID:x\r\nX-SWAMP-SYNC:\r\nEND:VCARD";
+  const wrong = "BEGIN:VCARD\r\nUID:x\r\nX-SWAMP-SYNC:gcal-nc-sync\r\nEND:VCARD";
+  const absent = "BEGIN:VCARD\r\nUID:x\r\nEND:VCARD";
+  assertEquals(vcfHasProvenance(stamped), true);
+  assertEquals(vcfHasProvenance(empty), false, "empty value must not count");
+  assertEquals(vcfHasProvenance(wrong), false, "wrong value must not count");
+  assertEquals(vcfHasProvenance(absent), false);
+});
+
+Deno.test("vcfHasProvenance falls back to NOTE sentinel (ADV-1)", () => {
+  const noteOnly = "BEGIN:VCARD\r\nUID:x\r\nNOTE:Swamp-managed contact (gcontacts-nc-sync)\r\nEND:VCARD";
+  assertEquals(vcfHasProvenance(noteOnly), true);
+});
+
+Deno.test("parseVcardMinimal extracts uid/fn/provenance and no PII", () => {
+  const vcf = "BEGIN:VCARD\r\nUID:c1\r\nFN:John Doe\r\nEMAIL:john@example.com\r\nX-SWAMP-SYNC:gcontacts-nc-sync\r\nEND:VCARD";
+  const ref = parseVcardMinimal(vcf);
+  assertEquals(ref, { uid: "c1", fn: "John Doe", hasProvenance: true });
+  // EMAIL is not in the output — PII minimal.
+  const serialized = JSON.stringify(ref);
+  assert(!serialized.includes("john@example.com"));
+});
+
+Deno.test("VCard round-trip: serialize + parse preserves uid/fn/provenance", () => {
+  const input = {
+    uid: "round-trip-1",
+    fn: "Doe; Jr",
+    org: "Acme, Inc",
+    categories: ["a", "b"],
+  };
+  const vcf = buildVcard(input);
+  const parsed = parseVcardMinimal(vcf);
+  assertEquals(parsed?.uid, input.uid);
+  assertEquals(parsed?.fn, input.fn);
+  assertEquals(parsed?.hasProvenance, true);
+});
+
+// ── CardDAV: PROPFIND + REPORT parsers ──────────────────────────────────────
+
+const ADDRESSBOOK_PROPFIND_FIXTURE = `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+  <d:response>
+    <d:href>/remote.php/dav/addressbooks/alice/</d:href>
+    <d:propstat><d:prop>
+      <d:displayname>alice</d:displayname>
+      <d:resourcetype><d:collection/></d:resourcetype>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/addressbooks/alice/gcontacts-sync/</d:href>
+    <d:propstat><d:prop>
+      <d:displayname>Google Contacts Sync</d:displayname>
+      <d:resourcetype><d:collection/><card:addressbook/></d:resourcetype>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/addressbooks/alice/friends/</d:href>
+    <d:propstat><d:prop>
+      <d:displayname>Friends</d:displayname>
+      <d:resourcetype><d:collection/><card:addressbook/></d:resourcetype>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+</d:multistatus>`;
+
+Deno.test("parseAddressbooks keeps addressbooks, drops bare principal collection", () => {
+  const abs = parseAddressbooks(ADDRESSBOOK_PROPFIND_FIXTURE);
+  assertEquals(abs.length, 2);
+  assertEquals(abs[0].displayName, "Google Contacts Sync");
+  assertEquals(abs[0].url, "/remote.php/dav/addressbooks/alice/gcontacts-sync/");
+  assertEquals(abs[1].displayName, "Friends");
+});
+
+const ADDRESSBOOK_REPORT_FIXTURE = `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+  <d:response>
+    <d:href>/remote.php/dav/addressbooks/neil/gcontacts-sync/stamped.vcf</d:href>
+    <d:propstat><d:prop>
+      <card:address-data>BEGIN:VCARD
+VERSION:4.0
+UID:stamped-uid
+FN:Stamp Ed
+X-SWAMP-SYNC:gcontacts-nc-sync
+END:VCARD</card:address-data>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/addressbooks/neil/gcontacts-sync/foreign.vcf</d:href>
+    <d:propstat><d:prop>
+      <card:address-data>BEGIN:VCARD
+VERSION:4.0
+UID:foreign-uid
+FN:Foreign Person
+END:VCARD</card:address-data>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/addressbooks/neil/gcontacts-sync/empty-prov.vcf</d:href>
+    <d:propstat><d:prop>
+      <card:address-data>BEGIN:VCARD
+VERSION:4.0
+UID:empty-prov
+FN:Empty Prov
+X-SWAMP-SYNC:
+END:VCARD</card:address-data>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/addressbooks/neil/gcontacts-sync/wrong-prov.vcf</d:href>
+    <d:propstat><d:prop>
+      <card:address-data>BEGIN:VCARD
+VERSION:4.0
+UID:wrong-prov
+FN:Wrong Prov
+X-SWAMP-SYNC:gcal-nc-sync
+END:VCARD</card:address-data>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+</d:multistatus>`;
+
+Deno.test("parseAddressbookReport extracts uid/fn/provenance with all four provenance cases (ADV-3)", () => {
+  const rows = parseAddressbookReport(ADDRESSBOOK_REPORT_FIXTURE);
+  assertEquals(rows.length, 4);
+  const stamped = rows.find((r) => r.uid === "stamped-uid")!;
+  assertEquals(stamped.fn, "Stamp Ed");
+  assertEquals(stamped.hasProvenance, true);
+  const foreign = rows.find((r) => r.uid === "foreign-uid")!;
+  assertEquals(foreign.hasProvenance, false, "no marker → false");
+  const empty = rows.find((r) => r.uid === "empty-prov")!;
+  assertEquals(empty.hasProvenance, false, "empty value → false (ADV-3)");
+  const wrong = rows.find((r) => r.uid === "wrong-prov")!;
+  assertEquals(wrong.hasProvenance, false, "wrong value → false (ADV-3)");
+});
+
+Deno.test("parseAddressbookReport NEVER leaks PII fields", () => {
+  // Add a VCard with an EMAIL — it must not appear in the parsed output.
+  const fixture = `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+  <d:response>
+    <d:href>/x.vcf</d:href>
+    <d:propstat><d:prop>
+      <card:address-data>BEGIN:VCARD
+UID:pii-test
+FN:Secret
+EMAIL:secret@example.com
+TEL:555-1234
+END:VCARD</card:address-data>
+    </d:prop></d:propstat>
+  </d:response>
+</d:multistatus>`;
+  const rows = parseAddressbookReport(fixture);
+  const serialized = JSON.stringify(rows);
+  assert(!serialized.includes("secret@example.com"));
+  assert(!serialized.includes("555-1234"));
+});
+
+// ── CardDAV: schema validation + defaults ──────────────────────────────────
+
+Deno.test("ContactInputSchema rejects NUL, path traversal, and oversized UIDs", () => {
+  assert(!ContactInputSchema.safeParse({ uid: "a\0b", fn: "x" }).success);
+  assert(!ContactInputSchema.safeParse({ uid: "../admin", fn: "x" }).success);
+  assert(!ContactInputSchema.safeParse({ uid: "a?b", fn: "x" }).success);
+  assert(!ContactInputSchema.safeParse({ uid: "a b", fn: "x" }).success);
+  assert(!ContactInputSchema.safeParse({ uid: "a".repeat(201), fn: "x" }).success);
+  assert(ContactInputSchema.safeParse({ uid: "valid-uid.1", fn: "ok" }).success);
+});
+
+Deno.test("DeleteContactsArgsSchema defaults mirror DeleteEventsArgsSchema", () => {
+  const parsed = DeleteContactsArgsSchema.parse({ addressbook: "gcontacts-sync" });
+  assertEquals(parsed.maxDeletes, 50);
+  assertEquals(parsed.requireProvenance, true);
+  assertEquals(parsed.dryRun, false);
+});
+
+Deno.test("CONTACTS_PROVENANCE_VALUE is the expected constant (ADV-5)", () => {
+  assertEquals(CONTACTS_PROVENANCE_VALUE, "gcontacts-nc-sync");
+});
+
+Deno.test("mkAddressbookBody escapes displayname and declares addressbook resourcetype", () => {
+  const body = mkAddressbookBody("A & B <x>");
+  assert(body.includes("<d:displayname>A &amp; B &lt;x&gt;</d:displayname>"));
+  assert(body.includes("<card:addressbook/>"));
+});
+
+Deno.test("addressbookQueryBody requests only UID/FN/provenance/NOTE (no PII)", () => {
+  const body = addressbookQueryBody();
+  assert(body.includes(`<card:prop name="UID"/>`));
+  assert(body.includes(`<card:prop name="FN"/>`));
+  assert(body.includes(`<card:prop name="${PROVENANCE_PROP}"/>`));
+  assert(body.includes(`<card:prop name="NOTE"/>`));
+  assert(!body.includes("EMAIL"));
+  assert(!body.includes("TEL"));
+  assert(!body.includes("ADR"));
 });
