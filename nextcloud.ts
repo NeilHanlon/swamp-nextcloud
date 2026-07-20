@@ -3091,7 +3091,7 @@ export const model = {
         const auth = basicAuth(g.username, g.appPassword);
         const url = `${notesBase(g.baseUrl)}/notes`;
         const resp = await davRequest("GET", url, auth, {
-          headers: { Accept: "application/json" },
+          headers: { Accept: "application/json", "OCS-APIRequest": "true" },
           okStatuses: [200],
           log: ctx.logger,
         });
@@ -3136,7 +3136,7 @@ export const model = {
         const auth = basicAuth(g.username, g.appPassword);
         const url = `${notesBase(g.baseUrl)}/notes/${args.id}`;
         const resp = await davRequest("GET", url, auth, {
-          headers: { Accept: "application/json" },
+          headers: { Accept: "application/json", "OCS-APIRequest": "true" },
           okStatuses: [200, 404],
           log: ctx.logger,
         });
@@ -3224,6 +3224,7 @@ export const model = {
             headers: {
               Accept: "application/json",
               "Content-Type": "application/json",
+              "OCS-APIRequest": "true",
             },
             okStatuses: [200, 201],
             log: ctx.logger,
@@ -3337,7 +3338,7 @@ export const model = {
           try {
             if (args.requireProvenance) {
               const get = await davRequest("GET", url, auth, {
-                headers: { Accept: "application/json" },
+                headers: { Accept: "application/json", "OCS-APIRequest": "true" },
                 okStatuses: [200, 404],
                 log: ctx.logger,
               });
@@ -3370,7 +3371,7 @@ export const model = {
             } else {
               // Without requireProvenance, just check existence via GET.
               const head = await davRequest("GET", url, auth, {
-                headers: { Accept: "application/json" },
+                headers: { Accept: "application/json", "OCS-APIRequest": "true" },
                 okStatuses: [200, 404],
                 log: ctx.logger,
               });
@@ -3392,6 +3393,7 @@ export const model = {
               continue;
             }
             const del = await davRequest("DELETE", url, auth, {
+              headers: { "OCS-APIRequest": "true" },
               okStatuses: [200, 204, 404],
               log: ctx.logger,
             });
