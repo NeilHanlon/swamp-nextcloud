@@ -1,8 +1,10 @@
 import { assert, assertEquals, assertThrows } from "jsr:@std/assert@1";
 import {
+  ALLOWED_CONTENT_TYPE_PREFIXES,
   addressbookQueryBody,
   addressbookUrl,
   basicAuth,
+  BLOCKED_EXTENSIONS,
   buildVcalendar,
   buildVcard,
   buildVtodo,
@@ -14,16 +16,21 @@ import {
   CONTACTS_PROVENANCE_VALUE,
   davBase,
   decodeXmlEntities,
+  DEFAULT_MAX_FILE_SIZE,
   DeleteContactsArgsSchema,
   DeleteEventsArgsSchema,
+  DeleteFileArgsSchema,
   DeleteTasksArgsSchema,
   escapeText,
   EventInputSchema,
   eventHref,
   extractAll,
   extractFirst,
+  FileSchema,
+  filesBase,
   fnv1a,
   foldLine,
+  GetFileArgsSchema,
   GlobalArgsSchema,
   hasControlChars,
   hasElement,
@@ -31,8 +38,13 @@ import {
   icalProp,
   icsHasProvenance,
   icsHasProvenanceValue,
+  ListFilesArgsSchema,
+  MAX_LIST_ENTRIES,
+  MAX_PATH_LENGTH,
+  MAX_PATH_SEGMENTS,
   mkAddressbookBody,
   mkcalendarBody,
+  MkdirArgsSchema,
   mkTasklistBody,
   notesBase,
   notesHasProvenance,
@@ -49,15 +61,18 @@ import {
   parseAddressbooks,
   parseCalendarReport,
   parseCalendars,
+  parseFilesReport,
   parseTasklists,
   parseTasksReport,
   parseVcardMinimal,
   parseVtodoMinimal,
   PROVENANCE_PROP,
+  PutFileArgsSchema,
   renderDtLine,
   safePath,
   sanitizeUidForPath,
   stampNotesProvenance,
+  SWAMP_SYNC_FOLDER,
   TaskInputSchema,
   taskHref,
   TASKS_PROVENANCE_VALUE,
@@ -66,6 +81,9 @@ import {
   unescapeText,
   utcStamp,
   validateContactUid,
+  validateContentType,
+  validateFilePath,
+  validateFileExtension,
   validateTaskUid,
   vcardProp,
   vcardPropAll,
@@ -1586,4 +1604,232 @@ Deno.test("RevokeShareArgsSchema requires a positive id and defaults dryRun", ()
 Deno.test("RevokeShareArgsSchema accepts dryRun", () => {
   const args = RevokeShareArgsSchema.parse({ id: 7, dryRun: true });
   assertEquals(args.dryRun, true);
+});
+
+// ── WebDAV Files ───────────────────────────────────────────────────────────
+
+Deno.test("filesBase constructs correct WebDAV URL with username encoding", () => {
+  assertEquals(
+    filesBase("https://cloud.example.com/", "alice"),
+    "https://cloud.example.com/remote.php/dav/files/alice",
+  );
+  assertEquals(
+    filesBase("https://cloud.example.com", "alice bob"),
+    "https://cloud.example.com/remote.php/dav/files/alice%20bob",
+  );
+});
+
+Deno.test("SWAMP_SYNC_FOLDER is swamp-sync", () => {
+  assertEquals(SWAMP_SYNC_FOLDER, "swamp-sync");
+});
+
+Deno.test("validateFilePath accepts valid relative paths", () => {
+  assertEquals(validateFilePath("report.pdf"), "report.pdf");
+  assertEquals(validateFilePath("docs/report.pdf"), "docs/report.pdf");
+  assertEquals(validateFilePath("a/b/c/d.txt"), "a/b/c/d.txt");
+});
+
+Deno.test("validateFilePath rejects empty path", () => {
+  assertThrows(() => validateFilePath(""));
+});
+
+Deno.test("validateFilePath rejects absolute paths", () => {
+  assertThrows(() => validateFilePath("/etc/passwd"));
+  assertThrows(() => validateFilePath("\\windows\\system32"));
+});
+
+Deno.test("validateFilePath rejects .. traversal", () => {
+  assertThrows(() => validateFilePath("../etc/passwd"));
+  assertThrows(() => validateFilePath("docs/../../secret"));
+});
+
+Deno.test("validateFilePath rejects . segment", () => {
+  assertThrows(() => validateFilePath("./report.pdf"));
+  assertThrows(() => validateFilePath("docs/./report.pdf"));
+});
+
+Deno.test("validateFilePath rejects NUL bytes", () => {
+  assertThrows(() => validateFilePath("file\0.txt"));
+});
+
+Deno.test("validateFilePath rejects empty segments", () => {
+  assertThrows(() => validateFilePath("docs//report.pdf"));
+  assertThrows(() => validateFilePath("docs/"));
+});
+
+Deno.test("validateFilePath rejects URL-encoded traversal", () => {
+  assertThrows(() => validateFilePath("%2e%2e%2fetc/passwd"));
+  assertThrows(() => validateFilePath("docs/%2E%2E/secret"));
+  assertThrows(() => validateFilePath("%2fetc/passwd"));
+  assertThrows(() => validateFilePath("docs%5c.."));
+});
+
+Deno.test("validateFilePath enforces segment count cap", () => {
+  const ok = "a/b/c/d/e/f/g/h/j/k"; // 10 segments = MAX_PATH_SEGMENTS
+  assertEquals(validateFilePath(ok), ok);
+  const tooMany = "a/b/c/d/e/f/g/h/j/k/l"; // 11 segments > MAX_PATH_SEGMENTS
+  assertThrows(() => validateFilePath(tooMany));
+});
+
+Deno.test("validateFilePath enforces length cap", () => {
+  const longPath = "a".repeat(MAX_PATH_LENGTH);
+  assertEquals(validateFilePath(longPath), longPath);
+  const tooLong = "a".repeat(MAX_PATH_LENGTH + 1);
+  assertThrows(() => validateFilePath(tooLong));
+});
+
+Deno.test("validateContentType accepts allowed types", () => {
+  assert(validateContentType("text/plain"));
+  assert(validateContentType("text/html"));
+  assert(validateContentType("application/json"));
+  assert(validateContentType("application/pdf"));
+  assert(validateContentType("image/png"));
+  assert(validateContentType("image/jpeg"));
+});
+
+Deno.test("validateContentType rejects disallowed types", () => {
+  assert(!validateContentType("application/javascript"));
+  assert(!validateContentType("application/x-sh"));
+  assert(!validateContentType("application/octet-stream"));
+  assert(!validateContentType("video/mp4"));
+});
+
+Deno.test("validateFileExtension accepts safe extensions", () => {
+  assert(validateFileExtension("report.pdf"));
+  assert(validateFileExtension("data.json"));
+  assert(validateFileExtension("photo.png"));
+  assert(validateFileExtension("photo.jpg"));
+  assert(validateFileExtension("readme.txt"));
+  assert(validateFileExtension("noext")); // no extension — allowed
+});
+
+Deno.test("validateFileExtension rejects blocked extensions", () => {
+  assert(!validateFileExtension("script.sh"));
+  assert(!validateFileExtension("malware.exe"));
+  assert(!validateFileExtension("hack.php"));
+  assert(!validateFileExtension("run.bat"));
+  assert(!validateFileExtension("run.cmd"));
+  assert(!validateFileExtension("run.ps1"));
+});
+
+Deno.test("FileSchema parses valid file entry", () => {
+  const f = FileSchema.parse({
+    path: "report.pdf",
+    size: 1024,
+    mtime: "Wed, 20 Jul 2026 12:00:00 GMT",
+    contentType: "application/pdf",
+    isDirectory: false,
+    etag: '"abc123"',
+  });
+  assertEquals(f.path, "report.pdf");
+  assertEquals(f.size, 1024);
+  assertEquals(f.isDirectory, false);
+});
+
+Deno.test("FileSchema accepts optional fields as undefined", () => {
+  const f = FileSchema.parse({
+    path: "folder",
+    size: 0,
+    isDirectory: true,
+  });
+  assertEquals(f.mtime, undefined);
+  assertEquals(f.contentType, undefined);
+  assertEquals(f.etag, undefined);
+});
+
+Deno.test("ListFilesArgsSchema defaults to root", () => {
+  const args = ListFilesArgsSchema.parse({});
+  assertEquals(args.path, "");
+});
+
+Deno.test("GetFileArgsSchema requires a path", () => {
+  assertThrows(() => GetFileArgsSchema.parse({}));
+  const args = GetFileArgsSchema.parse({ path: "report.pdf" });
+  assertEquals(args.path, "report.pdf");
+});
+
+Deno.test("PutFileArgsSchema defaults contentType and has no ifMatch", () => {
+  const args = PutFileArgsSchema.parse({ path: "f.txt", body: "hello" });
+  assertEquals(args.contentType, "application/octet-stream");
+  assertEquals(args.ifMatch, undefined);
+});
+
+Deno.test("PutFileArgsSchema accepts ifMatch for ETag drift", () => {
+  const args = PutFileArgsSchema.parse({
+    path: "f.txt",
+    body: "hello",
+    ifMatch: '"abc123"',
+  });
+  assertEquals(args.ifMatch, '"abc123"');
+});
+
+Deno.test("DeleteFileArgsSchema defaults dryRun to false", () => {
+  const args = DeleteFileArgsSchema.parse({ path: "f.txt" });
+  assertEquals(args.dryRun, false);
+});
+
+Deno.test("DeleteFileArgsSchema accepts dryRun", () => {
+  const args = DeleteFileArgsSchema.parse({ path: "f.txt", dryRun: true });
+  assertEquals(args.dryRun, true);
+});
+
+Deno.test("MkdirArgsSchema requires a path", () => {
+  assertThrows(() => MkdirArgsSchema.parse({}));
+  const args = MkdirArgsSchema.parse({ path: "new-folder" });
+  assertEquals(args.path, "new-folder");
+});
+
+Deno.test("parseFilesReport extracts file metadata from PROPFIND XML", () => {
+  const xml = `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/remote.php/dav/files/alice/swamp-sync/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:displayname>swamp-sync</d:displayname>
+        <d:resourcetype><d:collection/></d:resourcetype>
+        <d:getcontentlength>0</d:getcontentlength>
+        <d:getetag>"dir-etag"</d:getetag>
+      </d:prop>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/files/alice/swamp-sync/report.pdf</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:displayname>report.pdf</d:displayname>
+        <d:resourcetype></d:resourcetype>
+        <d:getcontentlength>2048</d:getcontentlength>
+        <d:getcontenttype>application/pdf</d:getcontenttype>
+        <d:getlastmodified>Wed, 20 Jul 2026 12:00:00 GMT</d:getlastmodified>
+        <d:getetag>"file-etag"</d:getetag>
+      </d:prop>
+    </d:propstat>
+  </d:response>
+</d:multistatus>`;
+  const files = parseFilesReport(xml, "https://cloud.example.com/remote.php/dav/files/alice/swamp-sync/");
+  assertEquals(files.length, 2);
+  assertEquals(files[0].isDirectory, true);
+  assertEquals(files[0].path, "swamp-sync");
+  assertEquals(files[1].isDirectory, false);
+  assertEquals(files[1].path, "report.pdf");
+  assertEquals(files[1].size, 2048);
+  assertEquals(files[1].contentType, "application/pdf");
+  assertEquals(files[1].etag, '"file-etag"');
+});
+
+Deno.test("DEFAULT_MAX_FILE_SIZE is 10MB", () => {
+  assertEquals(DEFAULT_MAX_FILE_SIZE, 10 * 1024 * 1024);
+});
+
+Deno.test("MAX_LIST_ENTRIES is 1000", () => {
+  assertEquals(MAX_LIST_ENTRIES, 1000);
+});
+
+Deno.test("MAX_PATH_SEGMENTS is 10", () => {
+  assertEquals(MAX_PATH_SEGMENTS, 10);
+});
+
+Deno.test("MAX_PATH_LENGTH is 500", () => {
+  assertEquals(MAX_PATH_LENGTH, 500);
 });

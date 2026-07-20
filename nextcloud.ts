@@ -2112,12 +2112,263 @@ export const RevokeShareArgsSchema = z.object({
 });
 
 // ---------------------------------------------------------------------------
+// WebDAV Files — CRUD for files/folders via the main NC WebDAV endpoint
+// ---------------------------------------------------------------------------
+
+/**
+ * WebDAV files base URL for a given user.
+ * All file operations are scoped to the `swamp-sync` provenance folder within
+ * this endpoint.
+ */
+export function filesBase(baseUrl: string, username: string): string {
+  return `${baseUrl.replace(/\/$/, "")}/remote.php/dav/files/${
+    encodeURIComponent(username)
+  }`;
+}
+
+/**
+ * Dedicated provenance folder for swamp-managed files. Files under this folder
+ * are considered swamp-managed; files outside are not. This avoids per-file
+ * provenance markers and limits the blast radius of file operations.
+ */
+export const SWAMP_SYNC_FOLDER = "swamp-sync";
+
+/** Maximum number of path segments allowed (SEC-4). */
+export const MAX_PATH_SEGMENTS = 10;
+
+/** Maximum total path length (SEC-4). */
+export const MAX_PATH_LENGTH = 500;
+
+/** Default max file size in bytes (10 MB) (SEC-3). */
+export const DEFAULT_MAX_FILE_SIZE = 10 * 1024 * 1024;
+
+/** Hard cap on list_files entries (SEC-5). */
+export const MAX_LIST_ENTRIES = 1000;
+
+/**
+ * Allowed content-type prefixes for put_file (SEC-3).
+ * Only safe, non-executable MIME types are permitted.
+ */
+export const ALLOWED_CONTENT_TYPE_PREFIXES = [
+  "text/",
+  "application/json",
+  "application/pdf",
+  "image/png",
+  "image/jpeg",
+] as const;
+
+/**
+ * Blocked file extensions (SEC-3). Executable/script types are rejected
+ * regardless of content-type header.
+ */
+export const BLOCKED_EXTENSIONS = new Set([
+  ".exe",
+  ".sh",
+  ".php",
+  ".bat",
+  ".cmd",
+  ".ps1",
+]);
+
+/**
+ * Validate a file path for WebDAV operations. Rejects absolute paths, `..`
+ * segments, `.`, NUL bytes, empty segments, and URL-encoded traversal
+ * (`%2e`, `%2f`, `%5c`). Caps segment count and total length.
+ *
+ * The path is relative to the SWAMP_SYNC_FOLDER — it must not start with `/`.
+ *
+ * Exported for tests.
+ */
+export function validateFilePath(path: string): string {
+  if (!path || path.length === 0) {
+    throw new Error("file path must not be empty");
+  }
+  if (path.length > MAX_PATH_LENGTH) {
+    throw new Error(
+      `file path exceeds max length (${MAX_PATH_LENGTH}): ${path.length} chars`,
+    );
+  }
+  if (path.includes("\0")) {
+    throw new Error("file path must not contain NUL bytes");
+  }
+  if (path.startsWith("/")) {
+    throw new Error("file path must be relative (no leading /)");
+  }
+  if (path.startsWith("\\")) {
+    throw new Error("file path must not start with backslash");
+  }
+  // Reject URL-encoded traversal sequences (case-insensitive)
+  const lower = path.toLowerCase();
+  if (
+    lower.includes("%2e") || lower.includes("%2f") || lower.includes("%5c")
+  ) {
+    throw new Error("file path contains encoded traversal sequence");
+  }
+  const segments = path.split("/");
+  if (segments.length > MAX_PATH_SEGMENTS) {
+    throw new Error(
+      `file path exceeds max segments (${MAX_PATH_SEGMENTS}): ${segments.length}`,
+    );
+  }
+  for (const seg of segments) {
+    if (seg === "") {
+      throw new Error(`file path contains empty segment: "${clip(path, 80)}"`);
+    }
+    if (seg === "..") {
+      throw new Error(`file path contains .. traversal: "${clip(path, 80)}"`);
+    }
+    if (seg === ".") {
+      throw new Error(`file path contains . segment: "${clip(path, 80)}"`);
+    }
+  }
+  return path;
+}
+
+/**
+ * Validate a content-type against the allowlist (SEC-3).
+ * Returns true if the content-type is allowed.
+ */
+export function validateContentType(contentType: string): boolean {
+  const ct = contentType.toLowerCase().trim();
+  return ALLOWED_CONTENT_TYPE_PREFIXES.some((prefix) => ct.startsWith(prefix));
+}
+
+/**
+ * Validate a filename against blocked extensions (SEC-3).
+ * Returns true if the extension is allowed (not blocked).
+ */
+export function validateFileExtension(filename: string): boolean {
+  const dot = filename.lastIndexOf(".");
+  if (dot === -1) return true; // no extension — allowed
+  const ext = filename.slice(dot).toLowerCase();
+  return !BLOCKED_EXTENSIONS.has(ext);
+}
+
+/** Schema for a file entry from PROPFIND. */
+export const FileSchema = z.object({
+  path: z.string(),
+  size: z.number(),
+  mtime: z.string().optional(),
+  contentType: z.string().optional(),
+  isDirectory: z.boolean(),
+  etag: z.string().optional(),
+});
+
+/** Args for list_files. */
+export const ListFilesArgsSchema = z.object({
+  path: z
+    .string()
+    .default("")
+    .describe(
+      "Relative path within the swamp-sync folder to list (empty = root).",
+    ),
+});
+
+/** Args for get_file. */
+export const GetFileArgsSchema = z.object({
+  path: z
+    .string()
+    .min(1)
+    .describe("Relative path within the swamp-sync folder to download."),
+});
+
+/** Args for put_file. */
+export const PutFileArgsSchema = z.object({
+  path: z
+    .string()
+    .min(1)
+    .describe("Relative path within the swamp-sync folder to upload."),
+  body: z
+    .string()
+    .describe("File content to upload. Never persisted or logged (PII)."),
+  contentType: z
+    .string()
+    .default("application/octet-stream")
+    .describe("MIME type of the file. Must be in the allowlist (SEC-3)."),
+  ifMatch: z
+    .string()
+    .optional()
+    .describe(
+      "ETag for optimistic concurrency (If-Match). Returns conflict on mismatch (ADV-3).",
+    ),
+});
+
+/** Args for delete_file. */
+export const DeleteFileArgsSchema = z.object({
+  path: z
+    .string()
+    .min(1)
+    .describe("Relative path within the swamp-sync folder to delete."),
+  dryRun: z
+    .boolean()
+    .default(false)
+    .describe("When true, preview deletion without mutating."),
+});
+
+/** Args for mkdir. */
+export const MkdirArgsSchema = z.object({
+  path: z
+    .string()
+    .min(1)
+    .describe("Relative path within the swamp-sync folder to create."),
+});
+
+/** PROPFIND body for listing files (Depth:1). Requests standard WebDAV properties. */
+export const PROPFIND_FILES_BODY = `<?xml version="1.0" encoding="UTF-8"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop>
+    <d:displayname/>
+    <d:getcontentlength/>
+    <d:getlastmodified/>
+    <d:getcontenttype/>
+    <d:resourcetype/>
+    <d:getetag/>
+  </d:prop>
+</d:propfind>`;
+
+/**
+ * Parse a PROPFIND response for file listings. Extracts metadata for each
+ * `<d:response>` element. The collection itself (the directory being listed)
+ * is included as the first entry.
+ *
+ * Returns an array of FileSchema entries.
+ */
+export function parseFilesReport(
+  xml: string,
+  _baseUrl: string,
+): z.infer<typeof FileSchema>[] {
+  const files: z.infer<typeof FileSchema>[] = [];
+  for (const resp of extractAll(xml, "response")) {
+    const href = extractFirst(resp, "href");
+    if (!href) continue;
+    const resourcetype = extractFirst(resp, "resourcetype") ?? "";
+    const isDirectory = /collection/i.test(resourcetype);
+    const displayName = extractFirst(resp, "displayname") ?? "";
+    const size = parseInt(extractFirst(resp, "getcontentlength") ?? "0", 10);
+    const mtime = extractFirst(resp, "getlastmodified") ?? undefined;
+    const contentType = extractFirst(resp, "getcontenttype") ?? undefined;
+    const etag = extractFirst(resp, "getetag") ?? undefined;
+    // Use the displayname if available, otherwise derive from href
+    const path = displayName || href;
+    files.push({
+      path,
+      size: isNaN(size) ? 0 : size,
+      mtime,
+      contentType,
+      isDirectory,
+      etag,
+    });
+  }
+  return files;
+}
+
+// ---------------------------------------------------------------------------
 // Model definition
 // ---------------------------------------------------------------------------
 
 export const model = {
   type: "@kneel/nextcloud",
-  version: "2026.07.20.4",
+  version: "2026.07.20.5",
   globalArguments: GlobalArgsSchema,
 
   resources: {
@@ -2375,6 +2626,42 @@ export const model = {
       description:
         "Outcome of a create/update share operation (ID + URL + shareType).",
       schema: ShareResultSchema,
+      lifetime: "1d" as const,
+      garbageCollection: 7,
+    },
+    files: {
+      description:
+        "Files listed from the WebDAV endpoint under the swamp-sync provenance folder (metadata only — no file bodies).",
+      schema: z.object({
+        path: z.string(),
+        files: z.array(FileSchema),
+        count: z.number(),
+      }),
+      lifetime: "1h" as const,
+      garbageCollection: 5,
+    },
+    file_content: {
+      description:
+        "Metadata for a downloaded file (path + size + contentType + etag). File bodies are NEVER persisted (PII).",
+      schema: z.object({
+        path: z.string(),
+        size: z.number(),
+        contentType: z.string(),
+        etag: z.string().optional(),
+      }),
+      lifetime: "1h" as const,
+      garbageCollection: 5,
+    },
+    file_operation: {
+      description:
+        "Outcome of a file operation (put/delete/mkdir). Path + outcome only — no file bodies.",
+      schema: z.object({
+        path: z.string(),
+        operation: z.string(),
+        success: z.boolean(),
+        etag: z.string().optional(),
+        error: z.string().optional(),
+      }),
       lifetime: "1d" as const,
       garbageCollection: 7,
     },
@@ -4115,6 +4402,298 @@ export const model = {
         return {
           dataHandles: [handle],
           methodResult: { id: args.id, outcome, httpStatus: resp.status },
+        };
+      },
+    },
+
+    // ── WebDAV Files methods ────────────────────────────────────────────
+
+    list_files: {
+      description:
+        "List files in the swamp-sync provenance folder via PROPFIND Depth:1. Returns metadata only — no file bodies. Hard cap 1000 entries (SEC-5).",
+      arguments: ListFilesArgsSchema,
+      execute: async (
+        args: z.infer<typeof ListFilesArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const subPath = args.path ? validateFilePath(args.path) : "";
+        const url = `${filesBase(g.baseUrl, g.username)}/${SWAMP_SYNC_FOLDER}${
+          subPath ? "/" + subPath : ""
+        }/`;
+        const resp = await davRequest("PROPFIND", url, auth, {
+          headers: {
+            "Content-Type": "application/xml; charset=utf-8",
+            Depth: "1",
+          },
+          body: PROPFIND_FILES_BODY,
+          okStatuses: [207],
+          log: ctx.logger,
+        });
+        const entries = parseFilesReport(resp.text, url);
+        // Hard cap (SEC-5)
+        const capped = entries.slice(0, MAX_LIST_ENTRIES);
+        ctx.logger?.info("list_files: found {count} entries at {path}", {
+          count: capped.length,
+          path: subPath || "/",
+        });
+        const handle = await ctx.writeResource("files", "files-main", {
+          path: subPath || "/",
+          files: capped,
+          count: capped.length,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    get_file: {
+      description:
+        "Download a file from the swamp-sync folder. Returns the file body via methodResult ONLY — never persisted or logged (PII discipline). Writes metadata-only file_content resource.",
+      arguments: GetFileArgsSchema,
+      execute: async (
+        args: z.infer<typeof GetFileArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const validatedPath = validateFilePath(args.path);
+        const url = `${
+          filesBase(g.baseUrl, g.username)
+        }/${SWAMP_SYNC_FOLDER}/${validatedPath}`;
+        const resp = await davRequest("GET", url, auth, {
+          log: ctx.logger,
+        });
+        const size = new TextEncoder().encode(resp.text).length;
+        const contentType = "application/octet-stream";
+        const etag = undefined;
+        ctx.logger?.info("get_file: downloaded {path} ({size} bytes)", {
+          path: clip(validatedPath, 120),
+          size,
+        });
+        const handle = await ctx.writeResource(
+          "file_content",
+          `file-${fnv1a(validatedPath)}`,
+          {
+            path: validatedPath,
+            size,
+            contentType,
+            etag,
+          },
+        );
+        return {
+          dataHandles: [handle],
+          methodResult: { body: resp.text, size, contentType },
+        };
+      },
+    },
+
+    put_file: {
+      description:
+        "Upload a file to the swamp-sync folder. Validates content-type allowlist (SEC-3), size cap (10MB default), and blocked extensions. Supports optional If-Match ETag for drift detection (ADV-3).",
+      arguments: PutFileArgsSchema,
+      execute: async (
+        args: z.infer<typeof PutFileArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const validatedPath = validateFilePath(args.path);
+        // SEC-3: content-type allowlist
+        if (!validateContentType(args.contentType)) {
+          throw new Error(
+            `put_file: content-type "${args.contentType}" not in allowlist (${
+              ALLOWED_CONTENT_TYPE_PREFIXES.join(", ")
+            })`,
+          );
+        }
+        // SEC-3: blocked extensions
+        if (!validateFileExtension(validatedPath)) {
+          throw new Error(
+            `put_file: extension of "${clip(validatedPath, 80)}" is blocked (${
+              [...BLOCKED_EXTENSIONS].join(", ")
+            })`,
+          );
+        }
+        // SEC-3: size cap
+        const bodyBytes = new TextEncoder().encode(args.body).length;
+        if (bodyBytes > DEFAULT_MAX_FILE_SIZE) {
+          throw new Error(
+            `put_file: body size ${bodyBytes} exceeds max ${DEFAULT_MAX_FILE_SIZE} bytes`,
+          );
+        }
+        const url = `${
+          filesBase(g.baseUrl, g.username)
+        }/${SWAMP_SYNC_FOLDER}/${validatedPath}`;
+        const headers: Record<string, string> = {
+          "Content-Type": args.contentType,
+        };
+        if (args.ifMatch) {
+          headers["If-Match"] = args.ifMatch;
+        }
+        const resp = await davRequest("PUT", url, auth, {
+          body: args.body,
+          headers,
+          okStatuses: [201, 204, 412],
+          log: ctx.logger,
+        });
+        // 412 = ETag mismatch (ADV-3)
+        if (resp.status === 412) {
+          const handle = await ctx.writeResource(
+            "file_operation",
+            `op-${fnv1a(validatedPath)}`,
+            {
+              path: validatedPath,
+              operation: "put",
+              success: false,
+              error: "conflict (ETag mismatch)",
+            },
+          );
+          return {
+            dataHandles: [handle],
+            methodResult: {
+              path: validatedPath,
+              operation: "put",
+              success: false,
+              outcome: "conflict",
+            },
+          };
+        }
+        const etag = resp.text.match(/etag["']?\s*:\s*["']([^"']+)/i)?.[1] ??
+          undefined;
+        ctx.logger?.info("put_file: uploaded {path} ({size} bytes)", {
+          path: clip(validatedPath, 120),
+          size: bodyBytes,
+        });
+        const handle = await ctx.writeResource(
+          "file_operation",
+          `op-${fnv1a(validatedPath)}`,
+          {
+            path: validatedPath,
+            operation: "put",
+            success: true,
+            etag,
+          },
+        );
+        return {
+          dataHandles: [handle],
+          methodResult: {
+            path: validatedPath,
+            operation: "put",
+            success: true,
+            etag,
+          },
+        };
+      },
+    },
+
+    delete_file: {
+      description:
+        "Delete a file from the swamp-sync folder. NOTE: Nextcloud moves deleted files to trash by default (ADV-2). Supports dryRun.",
+      arguments: DeleteFileArgsSchema,
+      execute: async (
+        args: z.infer<typeof DeleteFileArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const validatedPath = validateFilePath(args.path);
+        ctx.logger?.info("delete_file: {path} (dryRun={dryRun})", {
+          path: clip(validatedPath, 120),
+          dryRun: args.dryRun,
+        });
+        if (args.dryRun) {
+          const handle = await ctx.writeResource(
+            "file_operation",
+            `op-${fnv1a(validatedPath)}`,
+            {
+              path: validatedPath,
+              operation: "delete",
+              success: true,
+              error: "dry-run (would move to trash)",
+            },
+          );
+          return {
+            dataHandles: [handle],
+            methodResult: {
+              path: validatedPath,
+              operation: "delete",
+              success: true,
+              outcome: "would-delete",
+            },
+          };
+        }
+        const url = `${
+          filesBase(g.baseUrl, g.username)
+        }/${SWAMP_SYNC_FOLDER}/${validatedPath}`;
+        const resp = await davRequest("DELETE", url, auth, {
+          okStatuses: [204, 404],
+          log: ctx.logger,
+        });
+        const outcome = resp.status === 404 ? "not-found" : "deleted";
+        const handle = await ctx.writeResource(
+          "file_operation",
+          `op-${fnv1a(validatedPath)}`,
+          {
+            path: validatedPath,
+            operation: "delete",
+            success: resp.status !== 404,
+            error: resp.status === 404 ? "not-found" : undefined,
+          },
+        );
+        return {
+          dataHandles: [handle],
+          methodResult: {
+            path: validatedPath,
+            operation: "delete",
+            success: resp.status !== 404,
+            outcome,
+          },
+        };
+      },
+    },
+
+    mkdir: {
+      description:
+        "Create a directory in the swamp-sync folder via MKCOL. Idempotent — returns success if directory already exists (HTTP 405). Uses same path validation as file ops (SEC-4).",
+      arguments: MkdirArgsSchema,
+      execute: async (
+        args: z.infer<typeof MkdirArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const validatedPath = validateFilePath(args.path);
+        const url = `${
+          filesBase(g.baseUrl, g.username)
+        }/${SWAMP_SYNC_FOLDER}/${validatedPath}/`;
+        const resp = await davRequest("MKCOL", url, auth, {
+          okStatuses: [201, 405],
+          log: ctx.logger,
+        });
+        const alreadyExists = resp.status === 405;
+        ctx.logger?.info("mkdir: {path} (status={status})", {
+          path: clip(validatedPath, 120),
+          status: resp.status,
+        });
+        const handle = await ctx.writeResource(
+          "file_operation",
+          `op-${fnv1a(validatedPath)}`,
+          {
+            path: validatedPath,
+            operation: "mkdir",
+            success: true,
+            error: alreadyExists ? "already-exists" : undefined,
+          },
+        );
+        return {
+          dataHandles: [handle],
+          methodResult: {
+            path: validatedPath,
+            operation: "mkdir",
+            success: true,
+            outcome: alreadyExists ? "already-exists" : "created",
+          },
         };
       },
     },
