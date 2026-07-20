@@ -1038,22 +1038,34 @@ Deno.test("buildVtodo omits PRIORITY when 0 (undefined)", () => {
   assert(ics.includes("STATUS:NEEDS-ACTION"));
 });
 
-Deno.test("buildVtodo renders timed due with TZID", () => {
+Deno.test("buildVtodo renders timed due with TZID as RFC 5545 local-time form", () => {
   const ics = buildVtodo({
     uid: "u",
     summary: "s",
     due: { dateTime: "2026-07-21T09:00:00", timeZone: "America/Chicago" },
   });
-  assert(ics.includes("DUE;TZID=America/Chicago:09:00:00"));
+  // RFC 5545 §3.3.5: DUE;TZID=...:YYYYMMDDTHHMMSS (no colons, date included)
+  assert(ics.includes("DUE;TZID=America/Chicago:20260721T090000"));
 });
 
-Deno.test("buildVtodo renders timed due as UTC when no zone", () => {
+Deno.test("buildVtodo renders timed due as UTC when explicit Z", () => {
   const ics = buildVtodo({
     uid: "u",
     summary: "s",
     due: { dateTime: "2026-07-21T14:00:00Z" },
   });
   assert(ics.includes("DUE:20260721T140000Z"));
+});
+
+Deno.test("buildVtodo renders floating due (no zone) as local-time without Z", () => {
+  const ics = buildVtodo({
+    uid: "u",
+    summary: "s",
+    due: { dateTime: "2026-07-21T09:00:00" },
+  });
+  // RFC 5545 floating time: no Z, no TZID — server-local interpretation
+  assert(ics.includes("DUE:20260721T090000"));
+  assert(!ics.includes("DUE:20260721T090000Z"));
 });
 
 Deno.test("parseVtodoMinimal extracts uid/summary/status/provenance", () => {

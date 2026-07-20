@@ -1575,7 +1575,9 @@ export function parseTasklists(xml: string): z.infer<typeof TasklistSchema>[] {
       resp,
       "supported-calendar-component-set",
     ) ?? "";
-    const hasVtodoComp = /name=["']?VTODO["']?/i.test(componentSet);
+    // Match <c:comp name="VTODO"/> or <c:comp name='VTODO'> — exact attribute
+    // value, with a closing boundary so name="VTODO-EVIL" can't false-positive.
+    const hasVtodoComp = /name=["']VTODO["'](?:\s|\/|>)/i.test(componentSet);
     const isTasklist = calendarType === "VTODO" || hasVtodoComp;
     if (!isTasklist) continue;
 
@@ -1623,23 +1625,30 @@ export function taskHref(
   return `${calendarUrl(baseUrl, username, tasklist)}${safe}-${fnv1a(uid)}.ics`;
 }
 
-/** Render a DUE line (DATE or DATE-TIME). Empty string if no due is set. */
+/** Render a DUE line (DATE or DATE-TIME). Empty string if no due is set.
+ *
+ * RFC 5545 §3.3.5 forms:
+ *   - all-day:     DUE;VALUE=DATE:YYYYMMDD
+ *   - TZID:        DUE;TZID=<zone>:YYYYMMDDTHHMMSS (local time in the zone)
+ *   - UTC:         DUE:YYYYMMDDTHHMMSSZ
+ *   - floating:    DUE:YYYYMMDDTHHMMSS (no Z, no TZID — server's local time)
+ */
 function renderDueLine(due: TaskInput["due"]): string {
   if (!due) return "";
   if (due.date) return `DUE;VALUE=DATE:${due.date.replace(/-/g, "")}`;
   if (due.dateTime) {
     if (due.timeZone) {
-      return `DUE;TZID=${due.timeZone}:${
-        due.dateTime.replace(
-          /^(?:\d{4}-\d{2}-\d{2}T)(\d{2}:\d{2}:\d{2}).*$/,
-          "$1",
-        )
-      }`;
+      // Local-time form: strip non-digit/non-T chars (YYYYMMDDTHHMMSS).
+      return `DUE;TZID=${due.timeZone}:${compactLocal(due.dateTime)}`;
     }
-    // Fold to UTC instant.
-    const d = new Date(due.dateTime);
-    if (Number.isNaN(d.getTime())) return "";
-    return `DUE:${utcStamp(d)}`;
+    if (hasZone(due.dateTime)) {
+      // Explicit zone (Z or ±HH:MM) — fold to UTC instant.
+      const d = new Date(due.dateTime);
+      if (Number.isNaN(d.getTime())) return "";
+      return `DUE:${utcStamp(d)}`;
+    }
+    // Floating time: emit as local YYYYMMDDTHHMMSS without Z.
+    return `DUE:${compactLocal(due.dateTime)}`;
   }
   return "";
 }
@@ -1696,9 +1705,14 @@ export function parseVtodoMinimal(
   ics: string,
 ): z.infer<typeof TaskRefSchema> | null {
   if (!/BEGIN:VTODO/i.test(ics)) return null;
-  const uid = icalProp(ics, "UID");
-  if (!uid) return null;
-  const summary = sanitizeXmlText(icalProp(ics, "SUMMARY") ?? "");
+  const uidRaw = icalProp(ics, "UID");
+  if (!uidRaw) return null;
+  // Unescape iCal TEXT escapes (\\, \n \; \,) for consistency with the events
+  // and contacts parsers. Server-derived UIDs may carry escape sequences.
+  const uid = unescapeText(sanitizeXmlText(uidRaw));
+  const summary = unescapeText(
+    sanitizeXmlText(icalProp(ics, "SUMMARY") ?? ""),
+  );
   const status = (icalProp(ics, "STATUS") ?? "NEEDS-ACTION").toUpperCase();
   const hasProvenance = icsHasProvenanceValue(ics, TASKS_PROVENANCE_VALUE);
   return { uid, summary, status, hasProvenance };
