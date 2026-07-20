@@ -1955,25 +1955,28 @@ export const SharePermissionsSchema = z
 
 /** Schema for a single share entry from the OCS response. */
 export const ShareSchema = z.object({
-  id: z.number(),
-  share_type: z.number(),
+  id: z.coerce.number(),
+  share_type: z.coerce.number(),
   uid_owner: z.string().optional(),
   displayname_owner: z.string().optional(),
   path: z.string(),
-  permissions: z.number(),
+  permissions: z.coerce.number(),
   share_with: z.string().optional(),
   share_with_displayname: z.string().optional(),
   url: z.string().optional(),
-  token: z.string().optional(),
+  token: z.string().nullable().optional(),
   expiration: z.string().nullable().optional(),
   note: z.string().optional(),
   label: z.string().optional(),
-  hide_download: z.boolean().optional(),
+  hide_download: z.preprocess(
+    (v) => (typeof v === "number" ? v !== 0 : v),
+    z.boolean().optional(),
+  ),
 });
 
 /** Schema for create/update share result. */
 export const ShareResultSchema = z.object({
-  id: z.number(),
+  id: z.coerce.number(),
   url: z.string().optional(),
   shareType: z.number(),
   token: z.string().optional(),
@@ -3842,13 +3845,19 @@ export const model = {
         }
         const ocsData = (ocs?.ocs as Record<string, unknown>) ?? {};
         const shareData = (ocsData?.data as Record<string, unknown>) ?? {};
-        if (typeof shareData.id !== "number") {
-          throw new Error("POST /shares: ocs.data.id missing or not a number");
+        const shareIdRaw = shareData.id;
+        if (shareIdRaw === undefined || shareIdRaw === null) {
+          throw new Error("POST /shares: ocs.data.id missing");
         }
-        const shareId = shareData.id as number;
-        const shareType = (shareData.share_type as number) ?? args.shareType;
+        const shareId = typeof shareIdRaw === "string"
+          ? parseInt(shareIdRaw, 10)
+          : shareIdRaw as number;
+        const shareTypeRaw = shareData.share_type;
+        const shareType = typeof shareTypeRaw === "string"
+          ? parseInt(shareTypeRaw, 10)
+          : (shareTypeRaw as number) ?? args.shareType;
         const shareUrl = (shareData.url as string) ?? undefined;
-        const token = (shareData.token as string) ?? undefined;
+        const token = (shareData.token as string | null) ?? undefined;
         ctx.logger?.info("create_share: created share {id} for path {path}", {
           id: shareId,
           path: clip(args.path, 80),
@@ -3924,12 +3933,15 @@ export const model = {
         }
         const ocsData = (ocs?.ocs as Record<string, unknown>) ?? {};
         const shareData = (ocsData?.data as Record<string, unknown>) ?? {};
-        if (typeof shareData.id !== "number") {
-          throw new Error("POST /shares: ocs.data.id missing or not a number");
+        const shareIdRaw = shareData.id;
+        if (shareIdRaw === undefined || shareIdRaw === null) {
+          throw new Error("POST /shares: ocs.data.id missing");
         }
-        const shareId = shareData.id as number;
+        const shareId = typeof shareIdRaw === "string"
+          ? parseInt(shareIdRaw, 10)
+          : shareIdRaw as number;
         const shareUrl = (shareData.url as string) ?? undefined;
-        const token = (shareData.token as string) ?? undefined;
+        const token = (shareData.token as string | null) ?? undefined;
         ctx.logger?.info(
           "create_public_link: created link {id} for path {path}",
           { id: shareId, path: clip(args.path, 80) },
