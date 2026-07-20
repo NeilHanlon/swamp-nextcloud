@@ -5,6 +5,7 @@ import {
   basicAuth,
   buildVcalendar,
   buildVcard,
+  buildVtodo,
   calendarQueryBody,
   calendarUrl,
   clip,
@@ -15,6 +16,7 @@ import {
   decodeXmlEntities,
   DeleteContactsArgsSchema,
   DeleteEventsArgsSchema,
+  DeleteTasksArgsSchema,
   escapeText,
   EventInputSchema,
   eventHref,
@@ -28,23 +30,33 @@ import {
   hasZone,
   icalProp,
   icsHasProvenance,
+  icsHasProvenanceValue,
   mkAddressbookBody,
   mkcalendarBody,
+  mkTasklistBody,
   ocsBase,
   octetLength,
   parseAddressbookReport,
   parseAddressbooks,
   parseCalendarReport,
   parseCalendars,
+  parseTasklists,
+  parseTasksReport,
   parseVcardMinimal,
+  parseVtodoMinimal,
   PROVENANCE_PROP,
   renderDtLine,
   safePath,
   sanitizeUidForPath,
+  TaskInputSchema,
+  taskHref,
+  TASKS_PROVENANCE_VALUE,
+  tasksQueryBody,
   toCompactUtc,
   unescapeText,
   utcStamp,
   validateContactUid,
+  validateTaskUid,
   vcardProp,
   vcardPropAll,
   vcfHasProvenance,
@@ -902,4 +914,290 @@ Deno.test("addressbookQueryBody requests only UID/FN/provenance/NOTE (no PII)", 
   assert(!body.includes("EMAIL"));
   assert(!body.includes("TEL"));
   assert(!body.includes("ADR"));
+});
+
+// ── NC-TASKS: VTODO surface ────────────────────────────────────────────────
+
+Deno.test("TASKS_PROVENANCE_VALUE is the expected constant", () => {
+  assertEquals(TASKS_PROVENANCE_VALUE, "tasks-nc-sync");
+});
+
+Deno.test("validateTaskUid accepts safe UIDs and rejects path traversal", () => {
+  validateTaskUid("abc123@google.com");
+  validateTaskUid("foo-bar.baz_qux");
+  validateTaskUid("UID_2026.07.20@x");
+  assertThrows(() => validateTaskUid("../etc"), Error, "path-safe");
+  assertThrows(() => validateTaskUid("./"), Error, "path-safe");
+  assertThrows(() => validateTaskUid("a/b"), Error, "path-safe");
+  assertThrows(() => validateTaskUid("a?b"), Error, "path-safe");
+  assertThrows(() => validateTaskUid(""), Error);
+});
+
+Deno.test("validateTaskUid rejects NUL and over-long UIDs", () => {
+  assertThrows(() => validateTaskUid("a\0b"));
+  assertThrows(() => validateTaskUid("x".repeat(201)));
+});
+
+Deno.test("taskHref is deterministic and filesystem-safe", () => {
+  const a = taskHref("https://nc.example.com", "alice", "tasks", "uid-x@g.com");
+  const b = taskHref("https://nc.example.com", "alice", "tasks", "uid-x@g.com");
+  assertEquals(a, b, "same UID → same href (idempotent upsert)");
+  assert(a.endsWith(".ics"));
+  const name = a.split("/").pop()!;
+  assert(/^[A-Za-z0-9._@-]+\.ics$/.test(name), `unsafe name: ${name}`);
+  assert(a.includes("/calendars/alice/tasks/"));
+});
+
+Deno.test("TaskInputSchema rejects NUL, path traversal, and missing summary", () => {
+  assertThrows(() => TaskInputSchema.parse({ uid: "a\0b", summary: "x" }));
+  assertThrows(() => TaskInputSchema.parse({ uid: "../etc", summary: "x" }));
+  assertThrows(() => TaskInputSchema.parse({ uid: "ok-uid" }));
+});
+
+Deno.test("TaskInputSchema accepts a full VTODO task", () => {
+  const task = TaskInputSchema.parse({
+    uid: "abc@google.com",
+    summary: "Buy milk",
+    description: "From the store",
+    due: { date: "2026-07-21" },
+    status: "IN-PROCESS",
+    priority: 3,
+    percentComplete: 50,
+    categories: ["shopping", "errands"],
+    relatedTo: "parent-uid@google.com",
+    recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
+  });
+  assertEquals(task.uid, "abc@google.com");
+  assertEquals(task.status, "IN-PROCESS");
+  assertEquals(task.priority, 3);
+  assertEquals(task.percentComplete, 50);
+  assertEquals(task.categories, ["shopping", "errands"]);
+});
+
+Deno.test("TaskInputSchema clamps priority (0-9) and percentComplete (0-100)", () => {
+  assertThrows(() => TaskInputSchema.parse({ uid: "a", summary: "x", priority: 10 }));
+  assertThrows(() => TaskInputSchema.parse({ uid: "a", summary: "x", priority: -1 }));
+  assertThrows(() => TaskInputSchema.parse({ uid: "a", summary: "x", percentComplete: 101 }));
+  assertThrows(() => TaskInputSchema.parse({ uid: "a", summary: "x", percentComplete: -1 }));
+});
+
+Deno.test("buildVtodo emits a well-formed VTODO with all fields", () => {
+  const now = new Date("2026-07-20T12:00:00Z");
+  const ics = buildVtodo(
+    {
+      uid: "task-1@google.com",
+      summary: "Test task",
+      description: "A description with, commas and \"quotes\"",
+      due: { date: "2026-07-21" },
+      status: "IN-PROCESS",
+      priority: 5,
+      percentComplete: 75,
+      categories: ["a", "b"],
+      relatedTo: "parent@g.com",
+    },
+    now,
+  );
+  assert(ics.startsWith("BEGIN:VCALENDAR\r\n"));
+  assert(ics.includes("BEGIN:VTODO\r\n"));
+  assert(ics.includes("UID:task-1@google.com"));
+  assert(ics.includes("SUMMARY:Test task"));
+  assert(ics.includes("STATUS:IN-PROCESS"));
+  assert(ics.includes("PRIORITY:5"));
+  assert(ics.includes("PERCENT-COMPLETE:75"));
+  assert(ics.includes("CATEGORIES:a,b"));
+  assert(ics.includes("RELATED-TO;RELTYPE=PARENT:parent@g.com"));
+  assert(ics.includes("DUE;VALUE=DATE:20260721"));
+  assert(ics.includes(`${PROVENANCE_PROP}:${TASKS_PROVENANCE_VALUE}`));
+  assert(ics.includes("END:VTODO\r\n"));
+  assert(ics.includes("END:VCALENDAR\r\n"));
+  assert(ics.includes("DTSTAMP:20260720T120000Z"));
+});
+
+Deno.test("buildVtodo escapes CRLF injection in SUMMARY", () => {
+  const ics = buildVtodo({
+    uid: "uid-x",
+    summary: "line1\nBEGIN:VTODO\nUID:evil",
+  });
+  // escapeText turns real newlines into the literal 2-char sequence \n
+  assert(ics.includes("SUMMARY:line1\\nBEGIN:VTODO\\nUID:evil"));
+  // The injected \n must NOT produce a real newline — the SUMMARY line must
+  // stay on one logical line. Count real line endings in the file: every
+  // SUMMARY line ends with \r\n but the injected \n is literal text.
+  const lines = ics.split("\r\n");
+  const summaryLine = lines.find((l) => l.startsWith("SUMMARY:"));
+  assert(summaryLine !== undefined);
+  assert(
+    summaryLine!.endsWith("\\nUID:evil"),
+    "SUMMARY line must end with the escaped tail",
+  );
+});
+
+Deno.test("buildVtodo omits PRIORITY when 0 (undefined)", () => {
+  const ics = buildVtodo({ uid: "u", summary: "s" });
+  assert(!ics.includes("PRIORITY:"));
+  assert(ics.includes("STATUS:NEEDS-ACTION"));
+});
+
+Deno.test("buildVtodo renders timed due with TZID", () => {
+  const ics = buildVtodo({
+    uid: "u",
+    summary: "s",
+    due: { dateTime: "2026-07-21T09:00:00", timeZone: "America/Chicago" },
+  });
+  assert(ics.includes("DUE;TZID=America/Chicago:09:00:00"));
+});
+
+Deno.test("buildVtodo renders timed due as UTC when no zone", () => {
+  const ics = buildVtodo({
+    uid: "u",
+    summary: "s",
+    due: { dateTime: "2026-07-21T14:00:00Z" },
+  });
+  assert(ics.includes("DUE:20260721T140000Z"));
+});
+
+Deno.test("parseVtodoMinimal extracts uid/summary/status/provenance", () => {
+  const ics = `BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:task-1@g.com\r\nSUMMARY:Buy milk\r\nSTATUS:IN-PROCESS\r\n${PROVENANCE_PROP}:${TASKS_PROVENANCE_VALUE}\r\nDESCRIPTION:PII should not appear\r\nEND:VTODO\r\nEND:VCALENDAR\r\n`;
+  const ref = parseVtodoMinimal(ics);
+  assert(ref !== null);
+  assertEquals(ref!.uid, "task-1@g.com");
+  assertEquals(ref!.summary, "Buy milk");
+  assertEquals(ref!.status, "IN-PROCESS");
+  assertEquals(ref!.hasProvenance, true);
+});
+
+Deno.test("parseVtodoMinimal returns null for non-VTODO", () => {
+  const ics = `BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:x\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n`;
+  assertEquals(parseVtodoMinimal(ics), null);
+});
+
+Deno.test("parseVtodoMinimal default status is NEEDS-ACTION", () => {
+  const ics = `BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:task-2\r\nSUMMARY:No status\r\nEND:VTODO\r\nEND:VCALENDAR\r\n`;
+  const ref = parseVtodoMinimal(ics);
+  assertEquals(ref!.status, "NEEDS-ACTION");
+  assertEquals(ref!.hasProvenance, false);
+});
+
+Deno.test("icsHasProvenanceValue checks exact value, not just prefix", () => {
+  const marker = `${PROVENANCE_PROP}:${TASKS_PROVENANCE_VALUE}`;
+  const wrong = `${PROVENANCE_PROP}:gcal-nc-sync`;
+  assert(icsHasProvenanceValue(marker, TASKS_PROVENANCE_VALUE));
+  assert(!icsHasProvenanceValue(wrong, TASKS_PROVENANCE_VALUE));
+  assert(!icsHasProvenanceValue(marker, "gcal-nc-sync"));
+  assert(!icsHasProvenanceValue(marker, "tasks-nc"));
+});
+
+Deno.test("VTODO round-trip: serialize + parse preserves uid/summary/status/provenance", () => {
+  const now = new Date("2026-07-20T12:00:00Z");
+  const ics = buildVtodo(
+    { uid: "roundtrip@g.com", summary: "Round trip", status: "COMPLETED" },
+    now,
+  );
+  const ref = parseVtodoMinimal(ics);
+  assert(ref !== null);
+  assertEquals(ref!.uid, "roundtrip@g.com");
+  assertEquals(ref!.summary, "Round trip");
+  assertEquals(ref!.status, "COMPLETED");
+  assertEquals(ref!.hasProvenance, true);
+});
+
+Deno.test("mkTasklistBody escapes displayName and declares VTODO comp", () => {
+  const body = mkTasklistBody("Tasks <special>");
+  assert(body.includes("<d:displayname>Tasks &lt;special&gt;</d:displayname>"));
+  assert(body.includes('<c:comp name="VTODO"/>'));
+  assert(body.includes("mkcalendar"));
+});
+
+Deno.test("tasksQueryBody requests only UID/SUMMARY/STATUS/provenance (no PII)", () => {
+  const body = tasksQueryBody();
+  assert(body.includes(`<c:prop name="UID"/>`));
+  assert(body.includes(`<c:prop name="SUMMARY"/>`));
+  assert(body.includes(`<c:prop name="STATUS"/>`));
+  assert(body.includes(`<c:prop name="${PROVENANCE_PROP}"/>`));
+  assert(!body.includes("DESCRIPTION"));
+  assert(!body.includes("LOCATION"));
+  assert(!body.includes("CATEGORIES"));
+  assert(body.includes('<c:comp-filter name="VTODO"/>'));
+});
+
+Deno.test("parseTasklists keeps VTODO tasklists, drops VEVENT calendars", () => {
+  const xml = `<?xml version="1.0"?>
+<multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <response>
+    <href>/remote.php/dav/calendars/alice/</href>
+    <propstat><prop>
+      <resourcetype><d:collection/></resourcetype>
+      <displayname>alice</displayname>
+    </prop></propstat>
+  </response>
+  <response>
+    <href>/remote.php/dav/calendars/alice/personal/</href>
+    <propstat><prop>
+      <resourcetype><d:collection/><c:calendar/></resourcetype>
+      <displayname>Personal</displayname>
+      <calendar-type>VEVENT</calendar-type>
+    </prop></propstat>
+  </response>
+  <response>
+    <href>/remote.php/dav/calendars/alice/tasks/</href>
+    <propstat><prop>
+      <resourcetype><d:collection/><c:calendar/></resourcetype>
+      <displayname>Tasks</displayname>
+      <calendar-type>VTODO</calendar-type>
+    </prop></propstat>
+  </response>
+</multistatus>`;
+  const tasklists = parseTasklists(xml);
+  assertEquals(tasklists.length, 1);
+  assertEquals(tasklists[0].displayName, "Tasks");
+  assertEquals(tasklists[0].url, "/remote.php/dav/calendars/alice/tasks/");
+});
+
+Deno.test("parseTasklists drops a response that has fewer than 4 path segments", () => {
+  const xml = `<?xml version="1.0"?>
+<multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <response>
+    <href>/remote.php/dav/calendars/alice</href>
+    <propstat><prop>
+      <resourcetype><d:collection/></resourcetype>
+      <displayname>alice</displayname>
+    </prop></propstat>
+  </response>
+</multistatus>`;
+  const tasklists = parseTasklists(xml);
+  assertEquals(tasklists.length, 0);
+});
+
+Deno.test("parseTasksReport extracts tasks from a REPORT response", () => {
+  const xml = `<?xml version="1.0"?>
+<multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <response>
+    <href>/remote.php/dav/calendars/alice/tasks/abc.ics</href>
+    <propstat><prop>
+      <c:calendar-data>BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:abc\r\nSUMMARY:Task A\r\nSTATUS:NEEDS-ACTION\r\n${PROVENANCE_PROP}:${TASKS_PROVENANCE_VALUE}\r\nEND:VTODO\r\nEND:VCALENDAR\r\n</c:calendar-data>
+    </prop></propstat>
+  </response>
+  <response>
+    <href>/remote.php/dav/calendars/alice/tasks/def.ics</href>
+    <propstat><prop>
+      <c:calendar-data>BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:def\r\nSUMMARY:Task B\r\nSTATUS:COMPLETED\r\nEND:VTODO\r\nEND:VCALENDAR\r\n</c:calendar-data>
+    </prop></propstat>
+  </response>
+</multistatus>`;
+  const tasks = parseTasksReport(xml);
+  assertEquals(tasks.length, 2);
+  assertEquals(tasks[0].uid, "abc");
+  assertEquals(tasks[0].status, "NEEDS-ACTION");
+  assertEquals(tasks[0].hasProvenance, true);
+  assertEquals(tasks[1].uid, "def");
+  assertEquals(tasks[1].status, "COMPLETED");
+  assertEquals(tasks[1].hasProvenance, false);
+});
+
+Deno.test("DeleteTasksArgsSchema defaults mirror DeleteEventsArgsSchema", () => {
+  const args = DeleteTasksArgsSchema.parse({ tasklist: "tasks-nc-sync" });
+  assertEquals(args.requireProvenance, true);
+  assertEquals(args.dryRun, false);
+  assertEquals(args.maxDeletes, 50);
+  assertEquals(args.uids, []);
 });

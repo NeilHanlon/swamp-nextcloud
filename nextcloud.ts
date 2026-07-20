@@ -375,6 +375,137 @@ export const DeleteContactsArgsSchema = z.object({
 });
 
 // ---------------------------------------------------------------------------
+// CalDAV VTODO (tasks) method argument / task schemas
+// ---------------------------------------------------------------------------
+
+/**
+ * Task input schema for put_tasks. Mirrors the NC Tasks app's VTODO surface:
+ * UID + SUMMARY + DUE (date or datetime) + STATUS + PRIORITY + PERCENT-COMPLETE
+ * + CATEGORIES + DESCRIPTION + RELATED-TO (parent). Same escapeText + foldLine
+ * defense-in-depth as the VEVENT serializer.
+ */
+export const TaskInputSchema = z.object({
+  uid: z
+    .string()
+    .min(1)
+    .max(200)
+    .refine((s) => !s.includes("\0"), { message: "uid must not contain NUL" })
+    .refine((s) => /^[A-Za-z0-9_\-.@]{1,200}$/.test(s), {
+      message:
+        "uid must match /^[A-Za-z0-9_\\-.@]{1,200}$/ (path-traversal guard, SEC-2)",
+    })
+    .describe("Task UID — the cross-system unique upsert key."),
+  summary: z.string().min(1).max(500).describe("Task title (required)."),
+  description: z.string().max(5000).optional(),
+  due: z
+    .object({
+      date: z
+        .string()
+        .regex(/^\d{4}-\d{2}-\d{2}$/, "date must be YYYY-MM-DD")
+        .optional()
+        .describe("All-day due date, YYYY-MM-DD."),
+      dateTime: z
+        .string()
+        .regex(
+          /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?$/,
+          "dateTime must be an RFC3339 timestamp",
+        )
+        .optional()
+        .describe("RFC3339 timestamp for a timed due."),
+      timeZone: z
+        .string()
+        .regex(
+          /^[A-Za-z0-9_+\-\/]+$/,
+          "timeZone must be an IANA time zone name",
+        )
+        .optional(),
+    })
+    .optional()
+    .describe("Due date (mutually-exclusive date OR dateTime)."),
+  status: z
+    .enum(["NEEDS-ACTION", "COMPLETED", "IN-PROCESS", "CANCELLED"])
+    .default("NEEDS-ACTION")
+    .describe("VTODO STATUS value."),
+  priority: z
+    .number()
+    .int()
+    .min(0)
+    .max(9)
+    .optional()
+    .describe("RFC 5545 priority (0=undefined, 1=highest, 9=lowest)."),
+  percentComplete: z
+    .number()
+    .int()
+    .min(0)
+    .max(100)
+    .optional()
+    .describe("PERCENT-COMPLETE (0–100)."),
+  categories: z.array(z.string().max(100)).max(20).optional(),
+  relatedTo: z
+    .string()
+    .max(200)
+    .optional()
+    .describe("Parent task UID (RELATED-TO; RELTYPE=PARENT)."),
+  recurrence: z
+    .array(
+      z
+        .string()
+        .regex(
+          /^(RRULE|RDATE|EXDATE|EXRULE|RECURRENCE-ID)[;:]/i,
+          "recurrence must be a single RRULE/RDATE/EXDATE/EXRULE/RECURRENCE-ID line",
+        )
+        .refine((s) => !hasControlChars(s), {
+          message: "recurrence line must not contain line breaks",
+        }),
+    )
+    .optional(),
+});
+
+type TaskInput = z.input<typeof TaskInputSchema>;
+
+const ListTasklistsArgsSchema = z.object({});
+
+const CreateTasklistArgsSchema = z.object({});
+
+const ListTasksArgsSchema = z.object({
+  tasklist: z.string().min(1).describe("Target tasklist name."),
+});
+
+const PutTasksArgsSchema = z.object({
+  tasklist: z.string().min(1).describe("Target tasklist name."),
+  tasks: z
+    .array(TaskInputSchema)
+    .default([])
+    .describe("Tasks to upsert (fan-out). An empty batch is a no-op."),
+});
+
+export const DeleteTasksArgsSchema = z.object({
+  tasklist: z.string().min(1).describe("Target tasklist name."),
+  uids: z
+    .array(z.string().min(1))
+    .default([])
+    .describe("Task UIDs to delete (fan-out). An empty batch is a no-op."),
+  requireProvenance: z
+    .boolean()
+    .default(true)
+    .describe(
+      "When true (default), GET each VTODO and refuse to delete any that lacks the X-SWAMP-SYNC:tasks-nc-sync marker.",
+    ),
+  dryRun: z
+    .boolean()
+    .default(false)
+    .describe("When true, preview deletions without mutating."),
+  maxDeletes: z
+    .number()
+    .int()
+    .min(0)
+    .default(50)
+    .describe(
+      "Blast-radius cap: if the batch has MORE than this many uids, abort the whole delete.",
+    ),
+});
+
+// ---------------------------------------------------------------------------
 // Resource schemas — MUST NOT carry secrets or event PII
 // ---------------------------------------------------------------------------
 
@@ -437,6 +568,20 @@ const CalEventRefSchema = z.object({
       "and CalDAV RRULE-expansion disagree on which masters fall in a window, so a " +
       "still-live series could be wrongly removed (ADV-2).",
   ),
+});
+
+/** A task list (VTODO calendar-type collection) read back from a PROPFIND. */
+const TasklistSchema = z.object({
+  url: z.string(),
+  displayName: z.string(),
+});
+
+/** A single task read back from a tasklist (UID + SUMMARY + STATUS + provenance only). */
+const TaskRefSchema = z.object({
+  uid: z.string(),
+  summary: z.string(),
+  status: z.string(),
+  hasProvenance: z.boolean(),
 });
 
 // ---------------------------------------------------------------------------
@@ -1331,12 +1476,263 @@ export function parseAddressbookReport(xml: string): CardContactRef[] {
 }
 
 // ---------------------------------------------------------------------------
+// CalDAV VTODO (tasks) helpers — serializer, parser, PROPFIND
+// ---------------------------------------------------------------------------
+
+/**
+ * Provenance value for VTODO resources. Distinct from calendar (gcal-nc-sync)
+ * and contacts (gcontacts-nc-sync) so a task is never confused with a mirrored
+ * event or contact.
+ */
+export const TASKS_PROVENANCE_VALUE = "tasks-nc-sync";
+
+/** PROPFIND body that discovers task lists (VTODO component advertisements). */
+const PROPFIND_TASKLISTS_BODY = `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"
+            xmlns:ic="http://apple.com/ns/ical/"
+            xmlns:cs="http://calendarserver.org/ns/">
+  <d:prop>
+    <d:displayname/>
+    <d:resourcetype/>
+    <c:calendar-type/>
+    <ic:calendar-type/>
+    <c:supported-calendar-component-set/>
+    <cs:source/>
+  </d:prop>
+</d:propfind>`;
+
+/**
+ * Body for a CalDAV `calendar-query` REPORT over VTODOs. Requests only the
+ * structural fields (UID, SUMMARY, STATUS) and the provenance marker — no
+ * DESCRIPTION/LOCATION/CATEGORIES, so task PII is never pulled.
+ */
+export function tasksQueryBody(): string {
+  return `<?xml version="1.0" encoding="utf-8"?>
+<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop>
+    <d:getetag/>
+    <c:calendar-data>
+      <c:comp name="VCALENDAR">
+        <c:comp name="VTODO">
+          <c:prop name="UID"/>
+          <c:prop name="SUMMARY"/>
+          <c:prop name="STATUS"/>
+          <c:prop name="${PROVENANCE_PROP}"/>
+        </c:comp>
+      </c:comp>
+    </c:calendar-data>
+  </d:prop>
+  <c:filter>
+    <c:comp-filter name="VCALENDAR">
+      <c:comp-filter name="VTODO"/>
+    </c:comp-filter>
+  </c:filter>
+</c:calendar-query>`;
+}
+
+/**
+ * Build the MKCALENDAR body for a VTODO collection (tasklist). Sets
+ * `calendar-type = VTODO` so NC Tasks recognizes it.
+ */
+export function mkTasklistBody(displayName: string): string {
+  return `<?xml version="1.0" encoding="utf-8"?>
+<c:mkcalendar xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:set>
+    <d:prop>
+      <d:displayname>${xmlEscape(displayName)}</d:displayname>
+      <c:supported-calendar-component-set>
+        <c:comp name="VTODO"/>
+      </c:supported-calendar-component-set>
+    </d:prop>
+  </d:set>
+</c:mkcalendar>`;
+}
+
+/**
+ * Parse a tasklists PROPFIND multistatus. A task list is a calendar collection
+ * that advertises VTODO — either via `calendar-type=VTODO` (NC Tasks app) or
+ * via a `supported-calendar-component-set` that contains `<c:comp name="VTODO"/>`
+ * (NC Deck boards). The parent collection (/calendars/users/<u>/) is filtered
+ * out. VEVENT-only calendars are excluded.
+ */
+export function parseTasklists(xml: string): z.infer<typeof TasklistSchema>[] {
+  const out: z.infer<typeof TasklistSchema>[] = [];
+  for (const resp of extractAll(xml, "response")) {
+    const href = extractFirst(resp, "href") ?? "";
+    const resourcetype = extractFirst(resp, "resourcetype") ?? "";
+    if (!/calendar/i.test(resourcetype)) continue;
+    const segments = href.split("/").filter(Boolean);
+    if (segments.length < 4) continue;
+
+    const calendarType = sanitizeXmlText(
+      extractFirst(resp, "calendar-type") ?? "",
+    ).toUpperCase();
+    // Detect VTODO advertisement. Two sources: the legacy `calendar-type` prop
+    // (NC Tasks app emits `<calendar-type>VTODO</calendar-type>`) and the
+    // standard `supported-calendar-component-set` (Deck boards emit a comp-set
+    // with `<c:comp name="VTODO"/>`). Accept either.
+    const componentSet = extractFirst(
+      resp,
+      "supported-calendar-component-set",
+    ) ?? "";
+    const hasVtodoComp = /name=["']?VTODO["']?/i.test(componentSet);
+    const isTasklist = calendarType === "VTODO" || hasVtodoComp;
+    if (!isTasklist) continue;
+
+    // Webcal subscriptions (cs:source set, or resourcetype has <subscribed/>)
+    // are VEVENT-only; exclude them even if they advertise VTODO in the
+    // component-set (NC advertises both for any calendar).
+    const hasSource = hasElement(resourcetype, "subscribed") ||
+      extractFirst(resp, "source") !== null;
+    if (hasSource) continue;
+
+    const displayName =
+      sanitizeXmlText(extractFirst(resp, "displayname") ?? "") || href;
+    out.push({ url: href, displayName });
+  }
+  return out;
+}
+
+/**
+ * Validate a task UID for path safety. Reuses the SEC-2 allowlist from
+ * ContactInputSchema but extended with `@` (Google iCalUID convention).
+ */
+export function validateTaskUid(uid: string): void {
+  if (!/^[A-Za-z0-9_\-.@]{1,200}$/.test(uid)) {
+    throw new Error(
+      `task uid ${
+        JSON.stringify(uid)
+      } is not path-safe (allowlist: A-Za-z0-9_\\-.@)`,
+    );
+  }
+  if (uid.includes("\0")) throw new Error("task uid must not contain NUL");
+  if (uid === "." || uid === "..") {
+    throw new Error("task uid must not be . or ..");
+  }
+}
+
+/** Deterministic, filesystem-safe object name for a task UID. */
+export function taskHref(
+  baseUrl: string,
+  username: string,
+  tasklist: string,
+  uid: string,
+): string {
+  validateTaskUid(uid);
+  const safe = uid.replace(/[^A-Za-z0-9._@-]/g, "_").slice(0, 96);
+  return `${calendarUrl(baseUrl, username, tasklist)}${safe}-${fnv1a(uid)}.ics`;
+}
+
+/** Render a DUE line (DATE or DATE-TIME). Empty string if no due is set. */
+function renderDueLine(due: TaskInput["due"]): string {
+  if (!due) return "";
+  if (due.date) return `DUE;VALUE=DATE:${due.date.replace(/-/g, "")}`;
+  if (due.dateTime) {
+    if (due.timeZone) {
+      return `DUE;TZID=${due.timeZone}:${
+        due.dateTime.replace(
+          /^(?:\d{4}-\d{2}-\d{2}T)(\d{2}:\d{2}:\d{2}).*$/,
+          "$1",
+        )
+      }`;
+    }
+    // Fold to UTC instant.
+    const d = new Date(due.dateTime);
+    if (Number.isNaN(d.getTime())) return "";
+    return `DUE:${utcStamp(d)}`;
+  }
+  return "";
+}
+
+/**
+ * Build a full VCALENDAR wrapping a single VTODO. Same escape + fold defense
+ * as buildVcalendar. `now` is injected for deterministic testing (DTSTAMP).
+ */
+export function buildVtodo(task: TaskInput, now: Date = new Date()): string {
+  const lines: string[] = [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//kneel//swamp-nextcloud//EN",
+    "CALSCALE:GREGORIAN",
+    "BEGIN:VTODO",
+    `UID:${escapeText(task.uid)}`,
+    `DTSTAMP:${utcStamp(now)}`,
+    `CREATED:${utcStamp(now)}`,
+    `LAST-MODIFIED:${utcStamp(now)}`,
+    `SUMMARY:${escapeText(task.summary)}`,
+    `STATUS:${task.status ?? "NEEDS-ACTION"}`,
+    `${PROVENANCE_PROP}:${TASKS_PROVENANCE_VALUE}`,
+  ];
+  if (task.description) {
+    lines.push(`DESCRIPTION:${escapeText(task.description)}`);
+  }
+  const dueLine = renderDueLine(task.due);
+  if (dueLine) lines.push(dueLine);
+  if (task.priority !== undefined && task.priority > 0) {
+    lines.push(`PRIORITY:${task.priority}`);
+  }
+  if (task.percentComplete !== undefined) {
+    lines.push(`PERCENT-COMPLETE:${task.percentComplete}`);
+  }
+  if (task.categories && task.categories.length > 0) {
+    lines.push(`CATEGORIES:${task.categories.map(escapeText).join(",")}`);
+  }
+  if (task.relatedTo) {
+    lines.push(`RELATED-TO;RELTYPE=PARENT:${escapeText(task.relatedTo)}`);
+  }
+  for (const r of task.recurrence ?? []) {
+    lines.push(r.replace(/\r\n|\n|\r/g, " ").trim());
+  }
+  lines.push("END:VTODO", "END:VCALENDAR");
+  return lines.map(foldLine).join("\r\n") + "\r\n";
+}
+
+/**
+ * Parse a VTODO body (as returned by a CalDAV calendar-data property) into a
+ * minimal TaskRef: UID, SUMMARY, STATUS, hasProvenance. Returns null if the
+ * body is not a VTODO.
+ */
+export function parseVtodoMinimal(
+  ics: string,
+): z.infer<typeof TaskRefSchema> | null {
+  if (!/BEGIN:VTODO/i.test(ics)) return null;
+  const uid = icalProp(ics, "UID");
+  if (!uid) return null;
+  const summary = sanitizeXmlText(icalProp(ics, "SUMMARY") ?? "");
+  const status = (icalProp(ics, "STATUS") ?? "NEEDS-ACTION").toUpperCase();
+  const hasProvenance = icsHasProvenanceValue(ics, TASKS_PROVENANCE_VALUE);
+  return { uid, summary, status, hasProvenance };
+}
+
+/** Check whether an iCal body carries X-SWAMP-SYNC with a specific value (exact match). */
+export function icsHasProvenanceValue(ics: string, value: string): boolean {
+  // Use icalProp to read the full property value, then compare exactly.
+  // This prevents prefix matches where e.g. "tasks-nc" would match a body
+  // stamped with "tasks-nc-sync" (ADV-3 pattern applied).
+  const propVal = icalProp(ics, PROVENANCE_PROP);
+  return propVal === value;
+}
+
+/** Parse a tasks REPORT response into minimal task refs. */
+export function parseTasksReport(xml: string): z.infer<typeof TaskRefSchema>[] {
+  const out: z.infer<typeof TaskRefSchema>[] = [];
+  for (const resp of extractAll(xml, "response")) {
+    const raw = extractFirst(resp, "calendar-data");
+    if (!raw) continue;
+    const ics = decodeXmlEntities(raw);
+    const ref = parseVtodoMinimal(ics);
+    if (ref) out.push(ref);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Model definition
 // ---------------------------------------------------------------------------
 
 export const model = {
   type: "@kneel/nextcloud",
-  version: "2026.07.20.1",
+  version: "2026.07.20.2",
   globalArguments: GlobalArgsSchema,
 
   resources: {
@@ -1458,6 +1854,67 @@ export const model = {
         "Outcome of a contact deletion batch (UIDs + outcomes only).",
       schema: z.object({
         addressbook: z.string(),
+        dryRun: z.boolean(),
+        deleted: z.number(),
+        wouldDelete: z.number(),
+        skipped: z.number(),
+        failed: z.number(),
+        aborted: z.boolean(),
+        abortReason: z.string().optional(),
+        requested: z.number(),
+        results: z.array(DeleteOutcomeSchema),
+      }),
+      lifetime: "1d" as const,
+      garbageCollection: 7,
+    },
+    tasklists: {
+      description:
+        "Task lists (VTODO calendar-type collections) in the user's calendar home.",
+      schema: z.object({
+        tasklists: z.array(TasklistSchema),
+        count: z.number(),
+      }),
+      lifetime: "1h" as const,
+      garbageCollection: 5,
+    },
+    provision_tasklist: {
+      description:
+        "Outcome of a tasklist provisioning (MKCALENDAR w/ VTODO) request.",
+      schema: z.object({
+        tasklist: z.string(),
+        created: z.boolean(),
+        httpStatus: z.number(),
+      }),
+      lifetime: "infinite" as const,
+      garbageCollection: 3,
+    },
+    tasks: {
+      description:
+        "Tasks read back from a tasklist (UID + SUMMARY + STATUS + provenance flag only, no PII).",
+      schema: z.object({
+        tasklist: z.string(),
+        tasks: z.array(TaskRefSchema),
+        count: z.number(),
+      }),
+      lifetime: "1d" as const,
+      garbageCollection: 7,
+    },
+    upsert_tasks: {
+      description:
+        "Outcome of a task upsert batch (UIDs + outcomes only, no PII).",
+      schema: z.object({
+        tasklist: z.string(),
+        upserted: z.number(),
+        failed: z.number(),
+        results: z.array(UpsertOutcomeSchema),
+      }),
+      lifetime: "1d" as const,
+      garbageCollection: 7,
+    },
+    deletions_tasks: {
+      description: "Outcome of a task deletion batch (UIDs + outcomes only).",
+      schema: z.object({
+        tasklist: z.string(),
         dryRun: z.boolean(),
         deleted: z.number(),
         wouldDelete: z.number(),
@@ -2141,6 +2598,318 @@ export const model = {
           `deletions-${args.addressbook}`,
           {
             addressbook: args.addressbook,
+            dryRun: args.dryRun,
+            deleted,
+            wouldDelete,
+            skipped,
+            failed,
+            aborted: false,
+            requested: args.uids.length,
+            results,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    // ── CalDAV VTODO (tasks) methods ───────────────────────────────────────
+
+    list_tasklists: {
+      description:
+        "List task lists (VTODO calendar-type collections) in the user's calendar home via PROPFIND.",
+      arguments: ListTasklistsArgsSchema,
+      execute: async (
+        _args: z.infer<typeof ListTasklistsArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const url = `${davBase(g.baseUrl)}/calendars/${
+          encodeURIComponent(g.username)
+        }/`;
+        const resp = await davRequest("PROPFIND", url, auth, {
+          headers: {
+            "Content-Type": "application/xml; charset=utf-8",
+            Depth: "1",
+          },
+          body: PROPFIND_TASKLISTS_BODY,
+          log: ctx.logger,
+        });
+        const tasklists = parseTasklists(resp.text);
+        ctx.logger?.info("Found {count} task lists", {
+          count: tasklists.length,
+        });
+        const handle = await ctx.writeResource("tasklists", "main", {
+          tasklists,
+          count: tasklists.length,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    create_tasklist: {
+      description:
+        "Provision the tasks-nc-sync tasklist via MKCALENDAR w/ VTODO (idempotent).",
+      arguments: CreateTasklistArgsSchema,
+      execute: async (
+        _args: z.infer<typeof CreateTasklistArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const name = "tasks-nc-sync";
+        const url = calendarUrl(g.baseUrl, g.username, name);
+        const body = mkTasklistBody("Swamp Tasks Sync");
+        const resp = await davRequest("MKCALENDAR", url, auth, {
+          headers: { "Content-Type": "application/xml; charset=utf-8" },
+          body,
+          okStatuses: [201, 405],
+          log: ctx.logger,
+        });
+        const created = resp.status === 201;
+        ctx.logger?.info(
+          created
+            ? "Created tasklist {tasklist}"
+            : "Tasklist {tasklist} already exists",
+          { tasklist: name },
+        );
+        const handle = await ctx.writeResource(
+          "provision_tasklist",
+          `provision-${name}`,
+          { tasklist: name, created, httpStatus: resp.status },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    list_tasks: {
+      description:
+        "List tasks in a tasklist via a CalDAV calendar-query REPORT. Returns UID + SUMMARY + STATUS + provenance flag only (no PII).",
+      arguments: ListTasksArgsSchema,
+      execute: async (
+        args: z.infer<typeof ListTasksArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const url = calendarUrl(g.baseUrl, g.username, args.tasklist);
+        const body = tasksQueryBody();
+        const resp = await davRequest("REPORT", url, auth, {
+          headers: {
+            "Content-Type": "application/xml; charset=utf-8",
+            Depth: "1",
+          },
+          body,
+          log: ctx.logger,
+        });
+        const tasks = parseTasksReport(resp.text);
+        const withProv = tasks.filter((t) => t.hasProvenance).length;
+        ctx.logger?.info(
+          "Read {count} tasks from {tasklist} ({withProv} swamp-stamped)",
+          { count: tasks.length, tasklist: args.tasklist, withProv },
+        );
+        const handle = await ctx.writeResource(
+          "tasks",
+          `tasks-${args.tasklist}`,
+          {
+            tasklist: args.tasklist,
+            tasks,
+            count: tasks.length,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    put_tasks: {
+      description:
+        "Upsert tasks (VTODOs keyed by UID) into a tasklist via CalDAV PUT. Fan-out: one dispatch handles the whole batch.",
+      arguments: PutTasksArgsSchema,
+      execute: async (
+        args: z.infer<typeof PutTasksArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const results: z.infer<typeof UpsertOutcomeSchema>[] = [];
+
+        for (const task of args.tasks) {
+          try {
+            validateTaskUid(task.uid);
+            const href = taskHref(
+              g.baseUrl,
+              g.username,
+              args.tasklist,
+              task.uid,
+            );
+            const body = buildVtodo(task);
+            const resp = await davRequest("PUT", href, auth, {
+              headers: { "Content-Type": "text/calendar; charset=utf-8" },
+              body,
+              okStatuses: [200, 201, 204],
+              log: ctx.logger,
+            });
+            results.push({
+              uid: task.uid,
+              outcome: resp.status === 201 ? "created" : "updated",
+              httpStatus: resp.status,
+            });
+          } catch (e) {
+            results.push({
+              uid: task.uid,
+              outcome: "failed",
+              httpStatus: 0,
+              error: clip(e instanceof Error ? e.message : String(e)),
+            });
+          }
+        }
+
+        const failed = results.filter((r) => r.outcome === "failed").length;
+        ctx.logger?.info(
+          "Upserted {ok}/{total} tasks into {tasklist} ({failed} failed)",
+          {
+            ok: results.length - failed,
+            total: results.length,
+            tasklist: args.tasklist,
+            failed,
+          },
+        );
+        const handle = await ctx.writeResource(
+          "upsert_tasks",
+          `upsert-${args.tasklist}`,
+          {
+            tasklist: args.tasklist,
+            upserted: results.length - failed,
+            failed,
+            results,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    delete_tasks: {
+      description:
+        "Delete tasks by UID from a tasklist via CalDAV DELETE. Verifies provenance first; fan-out over the batch.",
+      arguments: DeleteTasksArgsSchema,
+      execute: async (
+        args: z.infer<typeof DeleteTasksArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const results: z.infer<typeof DeleteOutcomeSchema>[] = [];
+
+        if (args.maxDeletes > 0 && args.uids.length > args.maxDeletes) {
+          const abortReason =
+            `refusing to delete ${args.uids.length} tasks from ${args.tasklist}: ` +
+            `exceeds maxDeletes=${args.maxDeletes} blast-radius cap`;
+          ctx.logger?.info(
+            "delete_tasks ABORTED: {requested} uids exceed maxDeletes={cap} on {tasklist}",
+            {
+              requested: args.uids.length,
+              cap: args.maxDeletes,
+              tasklist: args.tasklist,
+            },
+          );
+          const handle = await ctx.writeResource(
+            "deletions_tasks",
+            `deletions-${args.tasklist}`,
+            {
+              tasklist: args.tasklist,
+              dryRun: args.dryRun,
+              deleted: 0,
+              wouldDelete: 0,
+              skipped: 0,
+              failed: 0,
+              aborted: true,
+              abortReason,
+              requested: args.uids.length,
+              results: [],
+            },
+          );
+          return { dataHandles: [handle] };
+        }
+
+        for (const uid of args.uids) {
+          try {
+            validateTaskUid(uid);
+            const href = taskHref(g.baseUrl, g.username, args.tasklist, uid);
+            if (args.requireProvenance) {
+              const get = await davRequest("GET", href, auth, {
+                okStatuses: [200, 404],
+                log: ctx.logger,
+              });
+              if (get.status === 404) {
+                results.push({ uid, outcome: "not-found", httpStatus: 404 });
+                continue;
+              }
+              if (!icsHasProvenanceValue(get.text, TASKS_PROVENANCE_VALUE)) {
+                results.push({
+                  uid,
+                  outcome: "skipped",
+                  httpStatus: get.status,
+                  error:
+                    "refusing to delete: task lacks the X-SWAMP-SYNC:tasks-nc-sync marker",
+                });
+                continue;
+              }
+            } else {
+              const head = await davRequest("HEAD", href, auth, {
+                okStatuses: [404, 405],
+                log: ctx.logger,
+              });
+              if (head.status === 404) {
+                results.push({ uid, outcome: "not-found", httpStatus: 404 });
+                continue;
+              }
+            }
+            if (args.dryRun) {
+              results.push({ uid, outcome: "would-delete", httpStatus: 200 });
+              continue;
+            }
+            const del = await davRequest("DELETE", href, auth, {
+              okStatuses: [200, 204, 404],
+              log: ctx.logger,
+            });
+            results.push({
+              uid,
+              outcome: del.status === 404 ? "not-found" : "deleted",
+              httpStatus: del.status,
+            });
+          } catch (e) {
+            results.push({
+              uid,
+              outcome: "failed",
+              httpStatus: 0,
+              error: clip(e instanceof Error ? e.message : String(e)),
+            });
+          }
+        }
+
+        const failed = results.filter((r) => r.outcome === "failed").length;
+        const deleted = results.filter((r) => r.outcome === "deleted").length;
+        const wouldDelete =
+          results.filter((r) => r.outcome === "would-delete").length;
+        const skipped = results.filter((r) => r.outcome === "skipped").length;
+        ctx.logger?.info(
+          args.dryRun
+            ? "Dry-run: would delete {wouldDelete} of {total} from {tasklist} ({skipped} skipped, {failed} failed)"
+            : "Deleted {deleted} tasks from {tasklist} ({skipped} skipped, {failed} failed)",
+          {
+            deleted,
+            wouldDelete,
+            total: results.length,
+            tasklist: args.tasklist,
+            skipped,
+            failed,
+          },
+        );
+        const handle = await ctx.writeResource(
+          "deletions_tasks",
+          `deletions-${args.tasklist}`,
+          {
+            tasklist: args.tasklist,
             dryRun: args.dryRun,
             deleted,
             wouldDelete,

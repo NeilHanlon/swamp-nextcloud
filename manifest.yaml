@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@kneel/nextcloud"
-version: "2026.07.20.1"
+version: "2026.07.20.2"
 description: |
   Drive a [Nextcloud](https://nextcloud.com/) instance from swamp over its
   CalDAV / CardDAV / WebDAV / OCS surfaces using an app-password (HTTP Basic) credential —
