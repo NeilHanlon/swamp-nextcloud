@@ -1741,12 +1741,115 @@ export function parseTasksReport(xml: string): z.infer<typeof TaskRefSchema>[] {
 }
 
 // ---------------------------------------------------------------------------
+// Notes REST API helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Base URL for the Nextcloud Notes REST API.
+ * Plain REST/JSON endpoints — NOT DAV. Same auth (appPassword HTTP Basic).
+ */
+export function notesBase(baseUrl: string): string {
+  return `${baseUrl.replace(/\/$/, "")}/index.php/apps/notes/api/v1`;
+}
+
+/** Provenance value for notes (used in the HTML-comment sentinel). */
+export const NOTES_PROVENANCE_VALUE = "swamp-managed (notes-nc-sync)";
+
+/**
+ * HTML-comment provenance sentinel. Invisible in rendered markdown but
+ * detectable in the raw note body.
+ */
+export function notesProvenanceSentinel(): string {
+  return `<!-- ${NOTES_PROVENANCE_VALUE} -->`;
+}
+
+/** Check whether a note body starts with the provenance sentinel (first line). */
+export function notesHasProvenance(body: string): boolean {
+  const firstLine = body.split("\n", 1)[0]?.trim() ?? "";
+  return firstLine === notesProvenanceSentinel();
+}
+
+/** Prepend the provenance sentinel + newline to a note body. */
+export function stampNotesProvenance(body: string): string {
+  return `${notesProvenanceSentinel()}\n${body}`;
+}
+
+/** Schema for a single note's metadata (no body — PII-bearing). */
+export const NoteSchema = z.object({
+  id: z.number(),
+  title: z.string(),
+  modified: z.number(),
+  category: z.string(),
+  favorite: z.boolean(),
+});
+
+/**
+ * Schema for note input (put_note). Title is validated to reject path
+ * traversal characters and control chars; max 200 chars.
+ */
+export const NoteInputSchema = z.object({
+  id: z.number().int().positive().optional(),
+  title: z
+    .string()
+    .min(1)
+    .max(200)
+    .refine(
+      (t) => !t.includes("/") && !t.includes("\\") && !hasControlChars(t),
+      { message: "title must not contain /, \\, NUL, or control characters" },
+    ),
+  content: z.string(),
+  category: z.string().optional(),
+});
+
+/** Args for list_notes (optional category filter). */
+export const ListNotesArgsSchema = z.object({
+  category: z
+    .string()
+    .optional()
+    .describe("When set, only return notes in this category."),
+});
+
+/** Args for get_note. */
+export const GetNoteArgsSchema = z.object({
+  id: z.number().int().positive().describe("Note ID to fetch."),
+});
+
+/** Args for put_note. */
+export const PutNoteArgsSchema = NoteInputSchema;
+
+/** Args for delete_notes (fan-out over ids). */
+export const DeleteNotesArgsSchema = z.object({
+  ids: z
+    .array(z.number().int().positive())
+    .default([])
+    .describe("Note IDs to delete (fan-out). An empty batch is a no-op."),
+  requireProvenance: z
+    .boolean()
+    .default(true)
+    .describe(
+      "When true (default), GET each note and refuse to delete any that lacks the provenance sentinel.",
+    ),
+  dryRun: z
+    .boolean()
+    .default(false)
+    .describe("When true, preview deletions without mutating."),
+  maxDeletes: z
+    .number()
+    .int()
+    .min(0)
+    .default(50)
+    .describe(
+      "Blast-radius cap: if the batch has MORE than this many ids, abort the whole delete.",
+    ),
+});
+
+// ---------------------------------------------------------------------------
 // Model definition
 // ---------------------------------------------------------------------------
 
 export const model = {
   type: "@kneel/nextcloud",
-  version: "2026.07.20.2",
+  version: "2026.07.20.3",
   globalArguments: GlobalArgsSchema,
 
   resources: {
@@ -1929,6 +2032,44 @@ export const model = {
       description: "Outcome of a task deletion batch (UIDs + outcomes only).",
       schema: z.object({
         tasklist: z.string(),
+        dryRun: z.boolean(),
+        deleted: z.number(),
+        wouldDelete: z.number(),
+        skipped: z.number(),
+        failed: z.number(),
+        aborted: z.boolean(),
+        abortReason: z.string().optional(),
+        requested: z.number(),
+        results: z.array(DeleteOutcomeSchema),
+      }),
+      lifetime: "1d" as const,
+      garbageCollection: 7,
+    },
+    notes: {
+      description:
+        "Notes metadata from the NC Notes app (id + title + modified + category + favorite; no bodies — PII).",
+      schema: z.object({
+        notes: z.array(NoteSchema),
+        count: z.number(),
+      }),
+      lifetime: "1d" as const,
+      garbageCollection: 7,
+    },
+    upsert_notes: {
+      description:
+        "Outcome of a note upsert batch (IDs + outcomes only, no bodies).",
+      schema: z.object({
+        upserted: z.number(),
+        failed: z.number(),
+        results: z.array(UpsertOutcomeSchema),
+      }),
+      lifetime: "1d" as const,
+      garbageCollection: 7,
+    },
+    deletions_notes: {
+      description:
+        "Outcome of a note deletion batch (IDs + outcomes only, no bodies).",
+      schema: z.object({
         dryRun: z.boolean(),
         deleted: z.number(),
         wouldDelete: z.number(),
@@ -2931,6 +3072,372 @@ export const model = {
             failed,
             aborted: false,
             requested: args.uids.length,
+            results,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    list_notes: {
+      description:
+        "List notes from the NC Notes app (metadata only — no bodies fetched). GET /notes with Accept: application/json.",
+      arguments: ListNotesArgsSchema,
+      execute: async (
+        args: z.infer<typeof ListNotesArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const url = `${notesBase(g.baseUrl)}/notes`;
+        const resp = await davRequest("GET", url, auth, {
+          headers: { Accept: "application/json" },
+          okStatuses: [200],
+          log: ctx.logger,
+        });
+        if (!resp.ok) {
+          throw new Error(
+            `GET /notes returned ${resp.status}: ${clip(resp.text, 200)}`,
+          );
+        }
+        let parsed: unknown[];
+        try {
+          parsed = JSON.parse(resp.text);
+        } catch {
+          throw new Error("GET /notes returned non-JSON response");
+        }
+        if (!Array.isArray(parsed)) {
+          throw new Error("GET /notes did not return a JSON array");
+        }
+        const allNotes = z.array(NoteSchema).parse(parsed);
+        const notes = args.category
+          ? allNotes.filter((n) => n.category === args.category)
+          : allNotes;
+        ctx.logger?.info("list_notes: found {count} notes", {
+          count: notes.length,
+        });
+        const handle = await ctx.writeResource("notes", "notes-main", {
+          notes,
+          count: notes.length,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    get_note: {
+      description:
+        "Fetch a single note by ID. Returns the full body via methodResult (never persisted in resources — PII discipline).",
+      arguments: GetNoteArgsSchema,
+      execute: async (
+        args: z.infer<typeof GetNoteArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const url = `${notesBase(g.baseUrl)}/notes/${args.id}`;
+        const resp = await davRequest("GET", url, auth, {
+          headers: { Accept: "application/json" },
+          okStatuses: [200, 404],
+          log: ctx.logger,
+        });
+        if (resp.status === 404) {
+          throw new Error(`Note ${args.id} not found`);
+        }
+        if (!resp.ok) {
+          throw new Error(
+            `GET /notes/${args.id} returned ${resp.status}: ${
+              clip(resp.text, 200)
+            }`,
+          );
+        }
+        let parsed: Record<string, unknown>;
+        try {
+          parsed = JSON.parse(resp.text);
+        } catch {
+          throw new Error("GET /notes/{id} returned non-JSON response");
+        }
+        const note = z
+          .object({
+            id: z.number(),
+            title: z.string(),
+            content: z.string(),
+            modified: z.number(),
+            category: z.string(),
+            favorite: z.boolean(),
+          })
+          .parse(parsed);
+        ctx.logger?.info("get_note: fetched note {id} ({title})", {
+          id: note.id,
+          title: clip(note.title, 80),
+        });
+        // Write metadata-only resource (no body — PII).
+        const handle = await ctx.writeResource("notes", `note-${args.id}`, {
+          notes: [
+            {
+              id: note.id,
+              title: note.title,
+              modified: note.modified,
+              category: note.category,
+              favorite: note.favorite,
+            },
+          ],
+          count: 1,
+        });
+        return {
+          dataHandles: [handle],
+          methodResult: {
+            id: note.id,
+            title: note.title,
+            content: note.content,
+            modified: note.modified,
+            category: note.category,
+            favorite: note.favorite,
+            hasProvenance: notesHasProvenance(note.content),
+          },
+        };
+      },
+    },
+
+    put_note: {
+      description:
+        "Create or update a note. If id is provided, PUT /notes/{id}; else POST /notes. Stamps provenance sentinel.",
+      arguments: PutNoteArgsSchema,
+      execute: async (
+        args: z.infer<typeof PutNoteArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const results: z.infer<typeof UpsertOutcomeSchema>[] = [];
+        const method = args.id ? "PUT" : "POST";
+        const url = args.id
+          ? `${notesBase(g.baseUrl)}/notes/${args.id}`
+          : `${notesBase(g.baseUrl)}/notes`;
+        const payload = JSON.stringify({
+          title: args.title,
+          content: stampNotesProvenance(args.content),
+          category: args.category ?? "",
+        });
+        try {
+          const resp = await davRequest(method, url, auth, {
+            body: payload,
+            headers: {
+              Accept: "application/json",
+              "Content-Type": "application/json",
+            },
+            okStatuses: [200, 201],
+            log: ctx.logger,
+          });
+          if (!resp.ok) {
+            results.push({
+              uid: String(args.id ?? "new"),
+              outcome: "failed",
+              httpStatus: resp.status,
+              error: clip(resp.text, 200),
+            });
+          } else {
+            let parsed: Record<string, unknown>;
+            try {
+              parsed = JSON.parse(resp.text);
+            } catch {
+              results.push({
+                uid: String(args.id ?? "new"),
+                outcome: "failed",
+                httpStatus: resp.status,
+                error: "non-JSON response",
+              });
+              const handle = await ctx.writeResource(
+                "upsert_notes",
+                "upsert-notes-main",
+                { upserted: 0, failed: 1, results },
+              );
+              return { dataHandles: [handle] };
+            }
+            const note = z.object({ id: z.number() }).parse(parsed);
+            ctx.logger?.info(
+              "put_note: {method} note {id} ({title}) -> {status}",
+              {
+                method,
+                id: note.id,
+                title: clip(args.title, 80),
+                status: resp.status,
+              },
+            );
+            results.push({
+              uid: String(note.id),
+              outcome: args.id ? "updated" : "created",
+              httpStatus: resp.status,
+            });
+          }
+        } catch (e) {
+          results.push({
+            uid: String(args.id ?? "new"),
+            outcome: "failed",
+            httpStatus: 0,
+            error: clip(e instanceof Error ? e.message : String(e)),
+          });
+        }
+        const failed = results.filter((r) => r.outcome === "failed").length;
+        const handle = await ctx.writeResource(
+          "upsert_notes",
+          "upsert-notes-main",
+          {
+            upserted: results.length - failed,
+            failed,
+            results,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    delete_notes: {
+      description:
+        "Delete notes by ID via REST DELETE. Fan-out over ids; verifies provenance first; supports dryRun + maxDeletes.",
+      arguments: DeleteNotesArgsSchema,
+      execute: async (
+        args: z.infer<typeof DeleteNotesArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const results: z.infer<typeof DeleteOutcomeSchema>[] = [];
+
+        if (args.maxDeletes > 0 && args.ids.length > args.maxDeletes) {
+          const abortReason = `refusing to delete ${args.ids.length} notes: ` +
+            `exceeds maxDeletes=${args.maxDeletes} blast-radius cap`;
+          ctx.logger?.info(
+            "delete_notes ABORTED: {requested} ids exceed maxDeletes={cap}; nothing deleted",
+            {
+              requested: args.ids.length,
+              cap: args.maxDeletes,
+            },
+          );
+          const handle = await ctx.writeResource(
+            "deletions_notes",
+            "deletions-notes-main",
+            {
+              dryRun: args.dryRun,
+              deleted: 0,
+              wouldDelete: 0,
+              skipped: 0,
+              failed: 0,
+              aborted: true,
+              abortReason,
+              requested: args.ids.length,
+              results: [],
+            },
+          );
+          return { dataHandles: [handle] };
+        }
+
+        for (const id of args.ids) {
+          const uid = String(id);
+          const url = `${notesBase(g.baseUrl)}/notes/${id}`;
+          try {
+            if (args.requireProvenance) {
+              const get = await davRequest("GET", url, auth, {
+                headers: { Accept: "application/json" },
+                okStatuses: [200, 404],
+                log: ctx.logger,
+              });
+              if (get.status === 404) {
+                results.push({
+                  uid,
+                  outcome: "not-found",
+                  httpStatus: 404,
+                });
+                continue;
+              }
+              // Parse body for provenance check; never log body.
+              let body = "";
+              try {
+                const parsed = JSON.parse(get.text);
+                body = parsed.content ?? "";
+              } catch {
+                // non-JSON: treat as no provenance
+              }
+              if (!notesHasProvenance(body)) {
+                results.push({
+                  uid,
+                  outcome: "skipped",
+                  httpStatus: get.status,
+                  error:
+                    "refusing to delete: note lacks the provenance sentinel",
+                });
+                continue;
+              }
+            } else {
+              // Without requireProvenance, just check existence via GET.
+              const head = await davRequest("GET", url, auth, {
+                headers: { Accept: "application/json" },
+                okStatuses: [200, 404],
+                log: ctx.logger,
+              });
+              if (head.status === 404) {
+                results.push({
+                  uid,
+                  outcome: "not-found",
+                  httpStatus: 404,
+                });
+                continue;
+              }
+            }
+            if (args.dryRun) {
+              results.push({
+                uid,
+                outcome: "would-delete",
+                httpStatus: 200,
+              });
+              continue;
+            }
+            const del = await davRequest("DELETE", url, auth, {
+              okStatuses: [200, 204, 404],
+              log: ctx.logger,
+            });
+            results.push({
+              uid,
+              outcome: del.status === 404 ? "not-found" : "deleted",
+              httpStatus: del.status,
+            });
+          } catch (e) {
+            results.push({
+              uid,
+              outcome: "failed",
+              httpStatus: 0,
+              error: clip(e instanceof Error ? e.message : String(e)),
+            });
+          }
+        }
+
+        const failed = results.filter((r) => r.outcome === "failed").length;
+        const deleted = results.filter((r) => r.outcome === "deleted").length;
+        const wouldDelete =
+          results.filter((r) => r.outcome === "would-delete").length;
+        const skipped = results.filter((r) => r.outcome === "skipped").length;
+        ctx.logger?.info(
+          args.dryRun
+            ? "Dry-run: would delete {wouldDelete} of {total} notes ({skipped} skipped, {failed} failed)"
+            : "Deleted {deleted} notes ({skipped} skipped, {failed} failed)",
+          {
+            deleted,
+            wouldDelete,
+            total: results.length,
+            skipped,
+            failed,
+          },
+        );
+        const handle = await ctx.writeResource(
+          "deletions_notes",
+          "deletions-notes-main",
+          {
+            dryRun: args.dryRun,
+            deleted,
+            wouldDelete,
+            skipped,
+            failed,
+            aborted: false,
+            requested: args.ids.length,
             results,
           },
         );

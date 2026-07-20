@@ -34,6 +34,15 @@ import {
   mkAddressbookBody,
   mkcalendarBody,
   mkTasklistBody,
+  notesBase,
+  notesHasProvenance,
+  notesProvenanceSentinel,
+  NOTES_PROVENANCE_VALUE,
+  NoteInputSchema,
+  NoteSchema,
+  ListNotesArgsSchema,
+  GetNoteArgsSchema,
+  DeleteNotesArgsSchema,
   ocsBase,
   octetLength,
   parseAddressbookReport,
@@ -48,6 +57,7 @@ import {
   renderDtLine,
   safePath,
   sanitizeUidForPath,
+  stampNotesProvenance,
   TaskInputSchema,
   taskHref,
   TASKS_PROVENANCE_VALUE,
@@ -1212,4 +1222,151 @@ Deno.test("DeleteTasksArgsSchema defaults mirror DeleteEventsArgsSchema", () => 
   assertEquals(args.dryRun, false);
   assertEquals(args.maxDeletes, 50);
   assertEquals(args.uids, []);
+});
+
+// ── Notes REST API helpers ──────────────────────────────────────────────────
+
+Deno.test("notesBase constructs the Notes API path", () => {
+  assertEquals(
+    notesBase("https://cloud.example.com"),
+    "https://cloud.example.com/index.php/apps/notes/api/v1",
+  );
+});
+
+Deno.test("notesBase strips trailing slash", () => {
+  assertEquals(
+    notesBase("https://cloud.example.com/"),
+    "https://cloud.example.com/index.php/apps/notes/api/v1",
+  );
+});
+
+Deno.test("notesProvenanceSentinel is an HTML comment", () => {
+  assertEquals(notesProvenanceSentinel(), "<!-- swamp-managed (notes-nc-sync) -->");
+});
+
+Deno.test("NOTES_PROVENANCE_VALUE is the bare provenance string", () => {
+  assertEquals(NOTES_PROVENANCE_VALUE, "swamp-managed (notes-nc-sync)");
+});
+
+Deno.test("notesHasProvenance detects sentinel on first line", () => {
+  const body = "<!-- swamp-managed (notes-nc-sync) -->\nHello world";
+  assertEquals(notesHasProvenance(body), true);
+});
+
+Deno.test("notesHasProvenance returns false when sentinel absent", () => {
+  assertEquals(notesHasProvenance("Hello world"), false);
+});
+
+Deno.test("notesHasProvenance returns false when sentinel is not on first line", () => {
+  const body = "Some text\n<!-- swamp-managed (notes-nc-sync) -->";
+  assertEquals(notesHasProvenance(body), false);
+});
+
+Deno.test("notesHasProvenance returns false for wrong sentinel", () => {
+  const body = "<!-- wrong-provenance -->\nHello";
+  assertEquals(notesHasProvenance(body), false);
+});
+
+Deno.test("notesHasProvenance returns false for empty string", () => {
+  assertEquals(notesHasProvenance(""), false);
+});
+
+Deno.test("stampNotesProvenance prepends sentinel + newline", () => {
+  const stamped = stampNotesProvenance("Hello world");
+  assertEquals(
+    stamped,
+    "<!-- swamp-managed (notes-nc-sync) -->\nHello world",
+  );
+});
+
+Deno.test("stampNotesProvenance result passes notesHasProvenance", () => {
+  const stamped = stampNotesProvenance("body text");
+  assertEquals(notesHasProvenance(stamped), true);
+});
+
+Deno.test("NoteSchema parses a valid note metadata object", () => {
+  const note = NoteSchema.parse({
+    id: 42,
+    title: "Test Note",
+    modified: 1700000000,
+    category: "personal",
+    favorite: false,
+  });
+  assertEquals(note.id, 42);
+  assertEquals(note.title, "Test Note");
+});
+
+Deno.test("NoteInputSchema accepts valid input", () => {
+  const input = NoteInputSchema.parse({
+    title: "New Note",
+    content: "body text",
+    category: "work",
+  });
+  assertEquals(input.title, "New Note");
+  assertEquals(input.content, "body text");
+  assertEquals(input.category, "work");
+});
+
+Deno.test("NoteInputSchema accepts input with id", () => {
+  const input = NoteInputSchema.parse({
+    id: 10,
+    title: "Update",
+    content: "updated body",
+  });
+  assertEquals(input.id, 10);
+});
+
+Deno.test("NoteInputSchema rejects title with forward slash", () => {
+  assertThrows(() =>
+    NoteInputSchema.parse({ title: "bad/title", content: "x" })
+  );
+});
+
+Deno.test("NoteInputSchema rejects title with backslash", () => {
+  assertThrows(() =>
+    NoteInputSchema.parse({ title: "bad\\title", content: "x" })
+  );
+});
+
+Deno.test("NoteInputSchema rejects title with control characters", () => {
+  assertThrows(() =>
+    NoteInputSchema.parse({ title: "bad\x00title", content: "x" })
+  );
+});
+
+Deno.test("NoteInputSchema rejects title longer than 200 chars", () => {
+  assertThrows(() =>
+    NoteInputSchema.parse({ title: "a".repeat(201), content: "x" })
+  );
+});
+
+Deno.test("NoteInputSchema accepts title exactly 200 chars", () => {
+  const input = NoteInputSchema.parse({
+    title: "a".repeat(200),
+    content: "x",
+  });
+  assertEquals(input.title.length, 200);
+});
+
+Deno.test("NoteInputSchema rejects empty title", () => {
+  assertThrows(() => NoteInputSchema.parse({ title: "", content: "x" }));
+});
+
+Deno.test("ListNotesArgsSchema accepts empty args", () => {
+  const args = ListNotesArgsSchema.parse({});
+  assertEquals(args.category, undefined);
+});
+
+Deno.test("GetNoteArgsSchema requires a positive id", () => {
+  assertThrows(() => GetNoteArgsSchema.parse({ id: -1 }));
+  const args = GetNoteArgsSchema.parse({ id: 42 });
+  assertEquals(args.id, 42);
+});
+
+Deno.test("DeleteNotesArgsSchema defaults match delete_events pattern", () => {
+  const args = DeleteNotesArgsSchema.parse({});
+  assertEquals(args.requireProvenance, true);
+  assertEquals(args.dryRun, false);
+  assertEquals(args.maxDeletes, 50);
+  assertEquals(args.ids, []);
 });
