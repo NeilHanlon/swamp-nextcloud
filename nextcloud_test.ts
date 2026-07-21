@@ -1833,3 +1833,461 @@ Deno.test("MAX_PATH_SEGMENTS is 10", () => {
 Deno.test("MAX_PATH_LENGTH is 500", () => {
   assertEquals(MAX_PATH_LENGTH, 500);
 });
+
+// ---------------------------------------------------------------------------
+// Deck API — constants, helpers, schemas, parsers
+// ---------------------------------------------------------------------------
+
+import {
+  BoardSchema,
+  CardInputSchema,
+  CardSchema,
+  CreateBoardArgsSchema,
+  CreateCardArgsSchema,
+  CreateStackArgsSchema,
+  DECK_MAX_DESCRIPTION_SIZE,
+  DECK_MAX_LIST_ENTRIES,
+  DECK_PROVENANCE_COLOR,
+  DECK_PROVENANCE_LABEL,
+  DECK_XSS_PATTERNS,
+  DeckLabelSchema,
+  DeleteBoardArgsSchema,
+  DeleteCardArgsSchema,
+  DeleteStackArgsSchema,
+  GetBoardArgsSchema,
+  ListBoardsArgsSchema,
+  ListCardsArgsSchema,
+  ListStacksArgsSchema,
+  StackSchema,
+  UpdateCardArgsSchema,
+  checkDeckXss,
+  deckBase,
+  deckHasProvenance,
+  parseBoard,
+  parseCard,
+  parseStack,
+  validateDeckTitle,
+} from "./nextcloud.ts";
+
+Deno.test("deckBase constructs Deck API URL and strips trailing slash", () => {
+  assertEquals(
+    deckBase("https://cloud.example.com"),
+    "https://cloud.example.com/apps/deck/api/v1.0",
+  );
+  assertEquals(
+    deckBase("https://cloud.example.com/"),
+    "https://cloud.example.com/apps/deck/api/v1.0",
+  );
+});
+
+Deno.test("DECK_PROVENANCE_LABEL is swamp-managed", () => {
+  assertEquals(DECK_PROVENANCE_LABEL, "swamp-managed");
+});
+
+Deno.test("DECK_PROVENANCE_COLOR is a valid hex color", () => {
+  assertEquals(DECK_PROVENANCE_COLOR, "1A73D5");
+  assertEquals(DECK_PROVENANCE_COLOR.length, 6);
+});
+
+Deno.test("DECK_MAX_LIST_ENTRIES is 500", () => {
+  assertEquals(DECK_MAX_LIST_ENTRIES, 500);
+});
+
+Deno.test("DECK_MAX_DESCRIPTION_SIZE is 100000", () => {
+  assertEquals(DECK_MAX_DESCRIPTION_SIZE, 100_000);
+});
+
+Deno.test("DECK_XSS_PATTERNS contains 4 patterns", () => {
+  assertEquals(DECK_XSS_PATTERNS.length, 4);
+});
+
+Deno.test("checkDeckXss rejects <script", () => {
+  checkDeckXss("hello", "test"); // passes
+  try {
+    checkDeckXss("<script>alert(1)</script>", "field");
+    throw new Error("should have thrown");
+  } catch (e) {
+    assertEquals((e as Error).message.includes("disallowed pattern"), true);
+  }
+});
+
+Deno.test("checkDeckXss rejects javascript: URIs", () => {
+  try {
+    checkDeckXss("click me: javascript:alert(1)", "field");
+    throw new Error("should have thrown");
+  } catch (e) {
+    assertEquals((e as Error).message.includes("disallowed pattern"), true);
+  }
+});
+
+Deno.test("checkDeckXss rejects data:text/html", () => {
+  try {
+    checkDeckXss("data:text/html,<h1>hi</h1>", "field");
+    throw new Error("should have thrown");
+  } catch (e) {
+    assertEquals((e as Error).message.includes("disallowed pattern"), true);
+  }
+});
+
+Deno.test("checkDeckXss rejects <iframe", () => {
+  try {
+    checkDeckXss("<iframe src='evil'></iframe>", "field");
+    throw new Error("should have thrown");
+  } catch (e) {
+    assertEquals((e as Error).message.includes("disallowed pattern"), true);
+  }
+});
+
+Deno.test("checkDeckXss is case-insensitive", () => {
+  try {
+    checkDeckXss("<SCRIPT>alert(1)</SCRIPT>", "field");
+    throw new Error("should have thrown");
+  } catch (e) {
+    assertEquals((e as Error).message.includes("disallowed pattern"), true);
+  }
+});
+
+Deno.test("validateDeckTitle accepts valid titles", () => {
+  assertEquals(validateDeckTitle("My Board"), "My Board");
+  assertEquals(validateDeckTitle("a".repeat(200)), "a".repeat(200));
+});
+
+Deno.test("validateDeckTitle rejects empty", () => {
+  try {
+    validateDeckTitle("");
+    throw new Error("should have thrown");
+  } catch (e) {
+    assertEquals((e as Error).message.includes("empty"), true);
+  }
+});
+
+Deno.test("validateDeckTitle rejects over 200 chars", () => {
+  try {
+    validateDeckTitle("a".repeat(201));
+    throw new Error("should have thrown");
+  } catch (e) {
+    assertEquals((e as Error).message.includes("200"), true);
+  }
+});
+
+Deno.test("validateDeckTitle rejects control chars", () => {
+  try {
+    validateDeckTitle("hello\x00world");
+    throw new Error("should have thrown");
+  } catch (e) {
+    assertEquals((e as Error).message.includes("control"), true);
+  }
+});
+
+Deno.test("validateDeckTitle rejects XSS patterns", () => {
+  for (const bad of ["<script>x", "javascript:x", "data:text/html:x", "<iframe>"]) {
+    try {
+      validateDeckTitle(bad);
+      throw new Error(`should have thrown for: ${bad}`);
+    } catch (e) {
+      assertEquals((e as Error).message.includes("disallowed"), true);
+    }
+  }
+});
+
+Deno.test("deckHasProvenance returns false for null/undefined/empty", () => {
+  assertEquals(deckHasProvenance(null), false);
+  assertEquals(deckHasProvenance(undefined), false);
+  assertEquals(deckHasProvenance([]), false);
+});
+
+Deno.test("deckHasProvenance detects label object with matching title", () => {
+  assertEquals(
+    deckHasProvenance([{ id: 1, title: "swamp-managed", color: "fff" }]),
+    true,
+  );
+});
+
+Deno.test("deckHasProvenance returns false when no matching label", () => {
+  assertEquals(
+    deckHasProvenance([{ id: 1, title: "other", color: "fff" }]),
+    false,
+  );
+});
+
+Deno.test("deckHasProvenance handles raw string labels", () => {
+  assertEquals(deckHasProvenance(["swamp-managed"]), true);
+  assertEquals(deckHasProvenance(["other"]), false);
+});
+
+Deno.test("DeckLabelSchema parses valid label", () => {
+  const label = DeckLabelSchema.parse({ id: 1, title: "todo", color: "ff0000" });
+  assertEquals(label.id, 1);
+  assertEquals(label.title, "todo");
+  assertEquals(label.color, "ff0000");
+});
+
+Deno.test("DeckLabelSchema accepts missing optional fields", () => {
+  const label = DeckLabelSchema.parse({ title: "todo" });
+  assertEquals(label.id, undefined);
+  assertEquals(label.color, undefined);
+});
+
+Deno.test("BoardSchema parses valid board", () => {
+  const board = BoardSchema.parse({
+    id: 1,
+    title: "My Board",
+    color: "1A73D5",
+    archived: false,
+    labels: [{ id: 1, title: "todo" }],
+  });
+  assertEquals(board.id, 1);
+  assertEquals(board.title, "My Board");
+  assertEquals(board.labels.length, 1);
+});
+
+Deno.test("BoardSchema defaults labels to empty array", () => {
+  const board = BoardSchema.parse({ id: 1, title: "x" });
+  assertEquals(board.labels, []);
+});
+
+Deno.test("StackSchema parses valid stack", () => {
+  const stack = StackSchema.parse({
+    id: 10,
+    title: "Todo",
+    boardId: 1,
+    order: 0,
+  });
+  assertEquals(stack.id, 10);
+  assertEquals(stack.boardId, 1);
+});
+
+Deno.test("CardSchema parses card with hasProvenance", () => {
+  const card = CardSchema.parse({
+    id: 100,
+    title: "Task 1",
+    stackId: 10,
+    order: 0,
+    hasProvenance: true,
+  });
+  assertEquals(card.id, 100);
+  assertEquals(card.hasProvenance, true);
+});
+
+Deno.test("CardInputSchema accepts valid input", () => {
+  const input = CardInputSchema.parse({
+    title: "My Card",
+    description: "Some content",
+    order: 5,
+  });
+  assertEquals(input.title, "My Card");
+  assertEquals(input.description, "Some content");
+  assertEquals(input.order, 5);
+});
+
+Deno.test("CardInputSchema defaults description to empty string", () => {
+  const input = CardInputSchema.parse({ title: "x" });
+  assertEquals(input.description, "");
+});
+
+Deno.test("CardInputSchema rejects XSS in title", () => {
+  try {
+    CardInputSchema.parse({ title: "<script>x" });
+    throw new Error("should have thrown");
+  } catch (e) {
+    assertEquals((e as Error).message.includes("disallowed"), true);
+  }
+});
+
+Deno.test("CardInputSchema rejects XSS in description", () => {
+  try {
+    CardInputSchema.parse({ title: "ok", description: "javascript:alert(1)" });
+    throw new Error("should have thrown");
+  } catch (e) {
+    assertEquals((e as Error).message.includes("disallowed"), true);
+  }
+});
+
+Deno.test("CardInputSchema rejects title over 200 chars", () => {
+  assertThrows(() => CardInputSchema.parse({ title: "a".repeat(201) }));
+});
+
+Deno.test("CardInputSchema rejects description over DECK_MAX_DESCRIPTION_SIZE", () => {
+  assertThrows(() =>
+    CardInputSchema.parse({
+      title: "ok",
+      description: "x".repeat(DECK_MAX_DESCRIPTION_SIZE + 1),
+    })
+  );
+});
+
+Deno.test("ListBoardsArgsSchema accepts empty object", () => {
+  const args = ListBoardsArgsSchema.parse({});
+  assertEquals(Object.keys(args).length, 0);
+});
+
+Deno.test("GetBoardArgsSchema requires positive boardId", () => {
+  assertThrows(() => GetBoardArgsSchema.parse({}));
+  assertThrows(() => GetBoardArgsSchema.parse({ boardId: 0 }));
+  assertThrows(() => GetBoardArgsSchema.parse({ boardId: -1 }));
+  const args = GetBoardArgsSchema.parse({ boardId: 42 });
+  assertEquals(args.boardId, 42);
+});
+
+Deno.test("CreateBoardArgsSchema accepts valid input", () => {
+  const args = CreateBoardArgsSchema.parse({ title: "My Board" });
+  assertEquals(args.title, "My Board");
+  assertEquals(args.color, undefined);
+});
+
+Deno.test("CreateBoardArgsSchema accepts hex color", () => {
+  const args = CreateBoardArgsSchema.parse({ title: "x", color: "ff00aa" });
+  assertEquals(args.color, "ff00aa");
+});
+
+Deno.test("CreateBoardArgsSchema rejects non-hex color", () => {
+  assertThrows(() => CreateBoardArgsSchema.parse({ title: "x", color: "xyz" }));
+  assertThrows(() => CreateBoardArgsSchema.parse({ title: "x", color: "#ff00aa" }));
+});
+
+Deno.test("CreateBoardArgsSchema rejects empty title", () => {
+  assertThrows(() => CreateBoardArgsSchema.parse({ title: "" }));
+});
+
+Deno.test("DeleteBoardArgsSchema defaults", () => {
+  const args = DeleteBoardArgsSchema.parse({ boardId: 1 });
+  assertEquals(args.boardId, 1);
+  assertEquals(args.dryRun, false);
+  assertEquals(args.maxDeletes, 100);
+});
+
+Deno.test("ListStacksArgsSchema requires positive boardId", () => {
+  assertThrows(() => ListStacksArgsSchema.parse({}));
+  const args = ListStacksArgsSchema.parse({ boardId: 5 });
+  assertEquals(args.boardId, 5);
+});
+
+Deno.test("CreateStackArgsSchema defaults order to 0", () => {
+  const args = CreateStackArgsSchema.parse({ boardId: 1, title: "Todo" });
+  assertEquals(args.order, 0);
+});
+
+Deno.test("DeleteStackArgsSchema defaults", () => {
+  const args = DeleteStackArgsSchema.parse({ stackId: 10 });
+  assertEquals(args.stackId, 10);
+  assertEquals(args.dryRun, false);
+  assertEquals(args.maxDeletes, 50);
+});
+
+Deno.test("ListCardsArgsSchema requires positive stackId", () => {
+  assertThrows(() => ListCardsArgsSchema.parse({}));
+  const args = ListCardsArgsSchema.parse({ stackId: 10 });
+  assertEquals(args.stackId, 10);
+});
+
+Deno.test("CreateCardArgsSchema accepts valid input", () => {
+  const args = CreateCardArgsSchema.parse({
+    stackId: 10,
+    title: "Task",
+    description: "Do it",
+  });
+  assertEquals(args.stackId, 10);
+  assertEquals(args.title, "Task");
+  assertEquals(args.description, "Do it");
+});
+
+Deno.test("CreateCardArgsSchema rejects XSS in title", () => {
+  assertThrows(() =>
+    CreateCardArgsSchema.parse({ stackId: 1, title: "<script>x" })
+  );
+});
+
+Deno.test("UpdateCardArgsSchema accepts etag", () => {
+  const args = UpdateCardArgsSchema.parse({
+    cardId: 100,
+    title: "Updated",
+    etag: '"abc123"',
+  });
+  assertEquals(args.cardId, 100);
+  assertEquals(args.etag, '"abc123"');
+});
+
+Deno.test("DeleteCardArgsSchema defaults requireProvenance to true", () => {
+  const args = DeleteCardArgsSchema.parse({ cardId: 100 });
+  assertEquals(args.cardId, 100);
+  assertEquals(args.requireProvenance, true);
+  assertEquals(args.dryRun, false);
+});
+
+Deno.test("DeleteCardArgsSchema accepts requireProvenance=false", () => {
+  const args = DeleteCardArgsSchema.parse({
+    cardId: 100,
+    requireProvenance: false,
+  });
+  assertEquals(args.requireProvenance, false);
+});
+
+Deno.test("parseBoard extracts board metadata", () => {
+  const board = parseBoard({
+    id: 1,
+    title: "Test Board",
+    color: "1A73D5",
+    archived: false,
+    labels: [{ id: 1, title: "todo", color: "fff" }],
+    // Extra fields should be ignored by BoardSchema.strip
+    owner: { uid: "alice" },
+    stacks: [],
+    users: [],
+  });
+  assertEquals(board.id, 1);
+  assertEquals(board.title, "Test Board");
+  assertEquals(board.labels.length, 1);
+});
+
+Deno.test("parseStack extracts stack metadata", () => {
+  const stack = parseStack({
+    id: 10,
+    title: "Todo",
+    boardId: 1,
+    order: 3,
+    cards: [{ id: 100, title: "x" }],
+  });
+  assertEquals(stack.id, 10);
+  assertEquals(stack.boardId, 1);
+  assertEquals(stack.order, 3);
+});
+
+Deno.test("parseCard extracts card metadata and derives hasProvenance", () => {
+  const cardWithProv = parseCard({
+    id: 100,
+    title: "Task 1",
+    stackId: 10,
+    order: 0,
+    description: "Secret stuff",
+    labels: [{ id: 1, title: "swamp-managed" }],
+  });
+  assertEquals(cardWithProv.id, 100);
+  assertEquals(cardWithProv.hasProvenance, true);
+
+  const cardNoProv = parseCard({
+    id: 101,
+    title: "Task 2",
+    stackId: 10,
+    order: 1,
+    labels: [{ id: 2, title: "other" }],
+  });
+  assertEquals(cardNoProv.hasProvenance, false);
+});
+
+Deno.test("parseCard handles missing labels array", () => {
+  const card = parseCard({
+    id: 100,
+    title: "Task",
+    stackId: 10,
+  });
+  assertEquals(card.hasProvenance, false);
+});
+
+Deno.test("parseCard handles snake_case stackId", () => {
+  const card = parseCard({
+    id: 100,
+    title: "Task",
+    stack_id: 10,
+  });
+  assertEquals(card.stackId, 10);
+});

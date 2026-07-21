@@ -2373,12 +2373,342 @@ export function parseFilesReport(
 }
 
 // ---------------------------------------------------------------------------
+// Deck API — boards / stacks / cards (REST/JSON)
+// ---------------------------------------------------------------------------
+
+/**
+ * Base URL for the Nextcloud Deck REST API v1.0.
+ * Plain REST/JSON endpoints — NOT DAV. Same auth (appPassword HTTP Basic).
+ */
+export function deckBase(baseUrl: string): string {
+  return `${baseUrl.replace(/\/$/, "")}/apps/deck/api/v1.0`;
+}
+
+/**
+ * Provenance label title. Cards created/updated by this model carry a Deck
+ * label with this exact title. delete_card checks for this label (SEC-1).
+ */
+export const DECK_PROVENANCE_LABEL = "swamp-managed";
+
+/** Default color for the swamp-managed provenance label (blue). */
+export const DECK_PROVENANCE_COLOR = "1A73D5";
+
+/** Hard cap on Deck list results (SEC-5). */
+export const DECK_MAX_LIST_ENTRIES = 500;
+
+/** Max card description size in chars (100KB) (SEC-3). */
+export const DECK_MAX_DESCRIPTION_SIZE = 100_000;
+
+/**
+ * XSS patterns rejected at the zod schema level for all Deck text inputs
+ * (titles, descriptions). Case-insensitive (SEC-2).
+ */
+export const DECK_XSS_PATTERNS: RegExp[] = [
+  /<script/i,
+  /javascript:/i,
+  /data:text\/html/i,
+  /<iframe/i,
+];
+
+/**
+ * Check text for Deck XSS patterns. Throws on match. Exported for tests.
+ */
+export function checkDeckXss(text: string, fieldName: string): void {
+  for (const pattern of DECK_XSS_PATTERNS) {
+    if (pattern.test(text)) {
+      throw new Error(
+        `${fieldName} contains disallowed pattern (${pattern.source})`,
+      );
+    }
+  }
+}
+
+/**
+ * Validate a Deck title: non-empty, ≤200 chars, no control chars, no XSS
+ * patterns (SEC-2, SEC-4). Exported for tests.
+ */
+export function validateDeckTitle(title: string): string {
+  if (!title || title.trim().length === 0) {
+    throw new Error("Deck title must not be empty");
+  }
+  if (title.length > 200) {
+    throw new Error(
+      `Deck title exceeds 200 chars: ${title.length} chars`,
+    );
+  }
+  if (hasControlChars(title)) {
+    throw new Error("Deck title must not contain control characters");
+  }
+  checkDeckXss(title, "Deck title");
+  return title;
+}
+
+/**
+ * Check whether a card's labels array includes the provenance label.
+ * Deck returns labels as objects `{title: string, ...}`. Also handles raw
+ * string arrays defensively. Exported for tests.
+ */
+export function deckHasProvenance(
+  labels: unknown[] | undefined | null,
+): boolean {
+  if (!Array.isArray(labels)) return false;
+  return labels.some((l) => {
+    if (typeof l === "string") return l === DECK_PROVENANCE_LABEL;
+    if (l && typeof l === "object" && "title" in l) {
+      return (l as { title: unknown }).title === DECK_PROVENANCE_LABEL;
+    }
+    return false;
+  });
+}
+
+// ── Deck Zod schemas ──────────────────────────────────────────────────────
+
+/** Schema for a Deck label (id + title + color). */
+export const DeckLabelSchema = z.object({
+  id: z.number().optional(),
+  title: z.string(),
+  color: z.string().optional(),
+});
+
+/**
+ * Schema for a Deck board (metadata only). Nested stacks/cards are NOT
+ * persisted here — use list_stacks / list_cards for those.
+ */
+export const BoardSchema = z.object({
+  id: z.number(),
+  title: z.string(),
+  color: z.string().optional(),
+  archived: z.boolean().optional(),
+  labels: z.array(DeckLabelSchema).default([]),
+});
+
+/** Schema for a Deck stack (metadata only; no nested cards). */
+export const StackSchema = z.object({
+  id: z.number(),
+  title: z.string(),
+  boardId: z.number(),
+  order: z.number().optional(),
+});
+
+/**
+ * Schema for a Deck card (metadata only).
+ * Description is NEVER persisted (PII) — only the hasProvenance flag.
+ */
+export const CardSchema = z.object({
+  id: z.number(),
+  title: z.string(),
+  stackId: z.number(),
+  order: z.number().optional(),
+  hasProvenance: z.boolean(),
+});
+
+/**
+ * Card input shape for create/update. Title validated for XSS at the zod
+ * level (SEC-2). Description validated but never persisted.
+ */
+export const CardInputSchema = z.object({
+  title: z
+    .string()
+    .min(1)
+    .max(200)
+    .refine((t) => {
+      if (hasControlChars(t)) return false;
+      for (const p of DECK_XSS_PATTERNS) if (p.test(t)) return false;
+      return true;
+    }, { message: "title contains disallowed pattern (XSS/control chars)" }),
+  description: z
+    .string()
+    .max(DECK_MAX_DESCRIPTION_SIZE)
+    .refine((d) => {
+      for (const p of DECK_XSS_PATTERNS) if (p.test(d)) return false;
+      return true;
+    }, { message: "description contains disallowed pattern (XSS)" })
+    .default(""),
+  order: z.number().int().min(0).optional(),
+});
+
+/** Helper: title zod field with XSS refine, reused across card args. */
+const deckTitleField = CardInputSchema.shape.title;
+/** Helper: description zod field with XSS refine + default. */
+const deckDescField = CardInputSchema.shape.description;
+/** Helper: order zod field. */
+const deckOrderField = CardInputSchema.shape.order;
+
+// ── Deck args schemas ───────────────────────────────────────────────────────
+
+/** Args for list_boards. */
+export const ListBoardsArgsSchema = z.object({});
+
+/** Args for get_board. */
+export const GetBoardArgsSchema = z.object({
+  boardId: z.number().int().positive().describe("Board ID to fetch."),
+});
+
+/** Args for create_board. */
+export const CreateBoardArgsSchema = z.object({
+  title: z
+    .string()
+    .min(1)
+    .max(200)
+    .describe("Board title (validated for XSS, SEC-2)."),
+  color: z
+    .string()
+    .regex(/^[0-9a-fA-F]{6}$/)
+    .optional()
+    .describe("Hex color for the board (6 chars, no #). Optional."),
+});
+
+/** Args for delete_board (cascade safety via maxDeletes, ADV-4). */
+export const DeleteBoardArgsSchema = z.object({
+  boardId: z.number().int().positive().describe("Board ID to delete."),
+  dryRun: z
+    .boolean()
+    .default(false)
+    .describe("When true, preview deletion without mutating."),
+  maxDeletes: z
+    .number()
+    .int()
+    .min(0)
+    .default(100)
+    .describe(
+      "Cascade safety cap: abort if board contains MORE than this many cards.",
+    ),
+});
+
+/** Args for list_stacks. */
+export const ListStacksArgsSchema = z.object({
+  boardId: z.number().int().positive().describe(
+    "Board ID to list stacks for.",
+  ),
+});
+
+/** Args for create_stack. */
+export const CreateStackArgsSchema = z.object({
+  boardId: z.number().int().positive().describe(
+    "Board to add the stack to.",
+  ),
+  title: z
+    .string()
+    .min(1)
+    .max(200)
+    .describe("Stack title (validated for XSS, SEC-2)."),
+  order: z
+    .number()
+    .int()
+    .min(0)
+    .default(0)
+    .describe("Sort order within the board."),
+});
+
+/** Args for delete_stack (cascade safety via maxDeletes, ADV-4). */
+export const DeleteStackArgsSchema = z.object({
+  stackId: z.number().int().positive().describe("Stack ID to delete."),
+  dryRun: z
+    .boolean()
+    .default(false)
+    .describe("When true, preview deletion without mutating."),
+  maxDeletes: z
+    .number()
+    .int()
+    .min(0)
+    .default(50)
+    .describe(
+      "Cascade safety cap: abort if stack contains MORE than this many cards.",
+    ),
+});
+
+/** Args for list_cards. */
+export const ListCardsArgsSchema = z.object({
+  stackId: z.number().int().positive().describe(
+    "Stack ID to list cards for.",
+  ),
+});
+
+/** Args for create_card. Provenance label is auto-assigned (SEC-1). */
+export const CreateCardArgsSchema = z.object({
+  stackId: z.number().int().positive().describe(
+    "Stack to add the card to.",
+  ),
+  title: deckTitleField.describe("Card title (XSS-validated, SEC-2)."),
+  description: deckDescField.describe(
+    "Card description (XSS-validated, NEVER persisted — PII).",
+  ),
+  order: deckOrderField.describe("Sort order in the stack."),
+});
+
+/** Args for update_card. Provenance label is preserved by Deck. */
+export const UpdateCardArgsSchema = z.object({
+  cardId: z.number().int().positive().describe("Card ID to update."),
+  title: deckTitleField.describe("New card title."),
+  description: deckDescField.describe(
+    "New card description (NEVER persisted — PII).",
+  ),
+  order: deckOrderField,
+  etag: z
+    .string()
+    .optional()
+    .describe("ETag for optimistic concurrency (ADV-3)."),
+});
+
+/** Args for delete_card. Refuses to delete non-provenance cards (SEC-1). */
+export const DeleteCardArgsSchema = z.object({
+  cardId: z.number().int().positive().describe("Card ID to delete."),
+  dryRun: z
+    .boolean()
+    .default(false)
+    .describe("When true, preview deletion without mutating."),
+  requireProvenance: z
+    .boolean()
+    .default(true)
+    .describe(
+      "When true (default), GET the card and refuse to delete unless it has the swamp-managed label.",
+    ),
+});
+
+// ── Deck response parsers ───────────────────────────────────────────────────
+
+/**
+ * Parse a raw board from the Deck API response.
+ */
+export function parseBoard(
+  raw: Record<string, unknown>,
+): z.infer<typeof BoardSchema> {
+  return BoardSchema.parse(raw);
+}
+
+/**
+ * Parse a raw stack from the Deck API response.
+ */
+export function parseStack(
+  raw: Record<string, unknown>,
+): z.infer<typeof StackSchema> {
+  return StackSchema.parse(raw);
+}
+
+/**
+ * Parse a raw card from the Deck API response. Extracts only metadata;
+ * description is NEVER persisted (PII). hasProvenance is derived from labels.
+ */
+export function parseCard(
+  raw: Record<string, unknown>,
+): z.infer<typeof CardSchema> {
+  const labels = (raw.labels as unknown[]) ?? [];
+  return CardSchema.parse({
+    id: raw.id as number,
+    title: raw.title as string,
+    stackId: (raw.stackId ?? raw.stack_id) as number,
+    order: raw.order as number | undefined,
+    hasProvenance: deckHasProvenance(labels),
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Model definition
 // ---------------------------------------------------------------------------
 
 export const model = {
   type: "@kneel/nextcloud",
-  version: "2026.07.20.5",
+  version: "2026.07.20.6",
   globalArguments: GlobalArgsSchema,
 
   resources: {
@@ -2671,6 +3001,91 @@ export const model = {
         success: z.boolean(),
         etag: z.string().optional(),
         error: z.string().optional(),
+      }),
+      lifetime: "1d" as const,
+      garbageCollection: 7,
+    },
+    boards: {
+      description:
+        "Deck boards (metadata + labels only; no nested stacks/cards — use list_stacks).",
+      schema: z.object({
+        boards: z.array(BoardSchema),
+        count: z.number(),
+      }),
+      lifetime: "1d" as const,
+      garbageCollection: 7,
+    },
+    board_result: {
+      description:
+        "Outcome of a board operation (id + title + outcome; no nested content).",
+      schema: z.object({
+        id: z.number().optional(),
+        title: z.string().optional(),
+        operation: z.string(),
+        success: z.boolean(),
+        httpStatus: z.number().optional(),
+        error: z.string().optional(),
+        cardCount: z.number().optional(),
+        aborted: z.boolean().optional(),
+        abortReason: z.string().optional(),
+        dryRun: z.boolean().optional(),
+      }),
+      lifetime: "1d" as const,
+      garbageCollection: 7,
+    },
+    stacks: {
+      description:
+        "Deck stacks for a board (metadata only; no nested cards — use list_cards).",
+      schema: z.object({
+        boardId: z.number(),
+        stacks: z.array(StackSchema),
+        count: z.number(),
+      }),
+      lifetime: "1d" as const,
+      garbageCollection: 7,
+    },
+    stack_result: {
+      description: "Outcome of a stack operation.",
+      schema: z.object({
+        id: z.number().optional(),
+        title: z.string().optional(),
+        boardId: z.number().optional(),
+        operation: z.string(),
+        success: z.boolean(),
+        httpStatus: z.number().optional(),
+        error: z.string().optional(),
+        cardCount: z.number().optional(),
+        aborted: z.boolean().optional(),
+        abortReason: z.string().optional(),
+        dryRun: z.boolean().optional(),
+      }),
+      lifetime: "1d" as const,
+      garbageCollection: 7,
+    },
+    cards: {
+      description:
+        "Deck cards for a stack (metadata only — descriptions NEVER persisted, PII).",
+      schema: z.object({
+        stackId: z.number(),
+        cards: z.array(CardSchema),
+        count: z.number(),
+      }),
+      lifetime: "1d" as const,
+      garbageCollection: 7,
+    },
+    card_result: {
+      description:
+        "Outcome of a card operation (id + title + outcome; no description — PII).",
+      schema: z.object({
+        id: z.number().optional(),
+        title: z.string().optional(),
+        stackId: z.number().optional(),
+        operation: z.string(),
+        success: z.boolean(),
+        httpStatus: z.number().optional(),
+        error: z.string().optional(),
+        hasProvenance: z.boolean().optional(),
+        dryRun: z.boolean().optional(),
       }),
       lifetime: "1d" as const,
       garbageCollection: 7,
@@ -4702,6 +5117,1132 @@ export const model = {
             operation: "mkdir",
             success: true,
             outcome: alreadyExists ? "already-exists" : "created",
+          },
+        };
+      },
+    },
+
+    // ── Deck API methods ──────────────────────────────────────────────
+
+    list_boards: {
+      description:
+        "List Deck boards (metadata + labels only; no nested stacks/cards). GET /boards with Accept: application/json.",
+      arguments: ListBoardsArgsSchema,
+      execute: async (
+        _args: z.infer<typeof ListBoardsArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const url = `${deckBase(g.baseUrl)}/boards`;
+        const resp = await davRequest("GET", url, auth, {
+          headers: { Accept: "application/json", "OCS-APIRequest": "true" },
+          okStatuses: [200],
+          log: ctx.logger,
+        });
+        if (!resp.ok) {
+          throw new Error(
+            `GET /boards returned ${resp.status}: ${clip(resp.text, 200)}`,
+          );
+        }
+        let parsed: unknown[];
+        try {
+          parsed = JSON.parse(resp.text);
+        } catch {
+          throw new Error("GET /boards returned non-JSON response");
+        }
+        if (!Array.isArray(parsed)) {
+          throw new Error("GET /boards did not return a JSON array");
+        }
+        const allBoards = z.array(BoardSchema).parse(parsed);
+        const boards = allBoards.slice(0, DECK_MAX_LIST_ENTRIES);
+        ctx.logger?.info("list_boards: found {count} boards", {
+          count: boards.length,
+        });
+        const handle = await ctx.writeResource("boards", "boards-main", {
+          boards,
+          count: boards.length,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    get_board: {
+      description:
+        "Fetch a single Deck board with stacks and cards (full shape). Card descriptions are returned via methodResult ONLY — never persisted in resources (PII).",
+      arguments: GetBoardArgsSchema,
+      execute: async (
+        args: z.infer<typeof GetBoardArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const url = `${deckBase(g.baseUrl)}/boards/${args.boardId}`;
+        const resp = await davRequest("GET", url, auth, {
+          headers: { Accept: "application/json", "OCS-APIRequest": "true" },
+          okStatuses: [200, 404],
+          log: ctx.logger,
+        });
+        if (resp.status === 404) {
+          throw new Error(`Board ${args.boardId} not found`);
+        }
+        if (!resp.ok) {
+          throw new Error(
+            `GET /boards/${args.boardId} returned ${resp.status}: ${
+              clip(resp.text, 200)
+            }`,
+          );
+        }
+        let raw: Record<string, unknown>;
+        try {
+          raw = JSON.parse(resp.text);
+        } catch {
+          throw new Error("GET /boards/{id} returned non-JSON response");
+        }
+        const board = parseBoard(raw);
+        const rawStacks = (raw.stacks as Record<string, unknown>[]) ?? [];
+        // Build full shape for methodResult (includes card descriptions — PII,
+        // transient only).
+        const fullStacks = rawStacks.map((s) => {
+          const rawCards = (s.cards as Record<string, unknown>[]) ?? [];
+          return {
+            id: s.id as number,
+            title: s.title as string,
+            boardId: (s.boardId ?? s.board_id) as number,
+            order: s.order as number | undefined,
+            cards: rawCards.map((c) => ({
+              id: c.id as number,
+              title: c.title as string,
+              description: (c.description as string) ?? "",
+              order: c.order as number | undefined,
+              labels: c.labels ?? [],
+              hasProvenance: deckHasProvenance(
+                (c.labels as unknown[]) ?? [],
+              ),
+            })),
+          };
+        });
+        const totalCards = fullStacks.reduce(
+          (acc, s) => acc + s.cards.length,
+          0,
+        );
+        ctx.logger?.info(
+          "get_board: fetched board {id} ({title}) with {stackCount} stacks ({cardCount} cards)",
+          {
+            id: board.id,
+            title: clip(board.title, 80),
+            stackCount: fullStacks.length,
+            cardCount: totalCards,
+          },
+        );
+        // Resource: metadata only (board + labels). No nested content.
+        const handle = await ctx.writeResource(
+          "boards",
+          `board-${args.boardId}`,
+          { boards: [board], count: 1 },
+        );
+        return {
+          dataHandles: [handle],
+          methodResult: {
+            id: board.id,
+            title: board.title,
+            color: board.color,
+            archived: board.archived ?? false,
+            labels: board.labels,
+            stacks: fullStacks,
+            totalCards,
+          },
+        };
+      },
+    },
+
+    create_board: {
+      description:
+        "Create a new Deck board. Returns the created board's metadata.",
+      arguments: CreateBoardArgsSchema,
+      execute: async (
+        args: z.infer<typeof CreateBoardArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        validateDeckTitle(args.title);
+        const body: Record<string, unknown> = { title: args.title };
+        if (args.color) body.color = args.color;
+        const url = `${deckBase(g.baseUrl)}/boards`;
+        const resp = await davRequest("POST", url, auth, {
+          body: JSON.stringify(body),
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            "OCS-APIRequest": "true",
+          },
+          okStatuses: [200, 201],
+          log: ctx.logger,
+        });
+        if (!resp.ok) {
+          throw new Error(
+            `POST /boards returned ${resp.status}: ${clip(resp.text, 200)}`,
+          );
+        }
+        let raw: Record<string, unknown>;
+        try {
+          raw = JSON.parse(resp.text);
+        } catch {
+          throw new Error("POST /boards returned non-JSON response");
+        }
+        const board = parseBoard(raw);
+        ctx.logger?.info("create_board: created board {id} ({title})", {
+          id: board.id,
+          title: clip(board.title, 80),
+        });
+        const handle = await ctx.writeResource(
+          "board_result",
+          `board-${board.id}`,
+          {
+            id: board.id,
+            title: board.title,
+            operation: "create",
+            success: true,
+            httpStatus: resp.status,
+          },
+        );
+        return {
+          dataHandles: [handle],
+          methodResult: {
+            id: board.id,
+            title: board.title,
+            color: board.color,
+            operation: "create",
+            success: true,
+          },
+        };
+      },
+    },
+
+    delete_board: {
+      description:
+        "Delete a Deck board. Cascade safety: counts all cards across all stacks before deleting — aborts if count exceeds maxDeletes (ADV-4). Supports dryRun.",
+      arguments: DeleteBoardArgsSchema,
+      execute: async (
+        args: z.infer<typeof DeleteBoardArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        // Fetch board first to count cards (cascade safety).
+        const getUrl = `${deckBase(g.baseUrl)}/boards/${args.boardId}`;
+        const getResp = await davRequest("GET", getUrl, auth, {
+          headers: { Accept: "application/json", "OCS-APIRequest": "true" },
+          okStatuses: [200, 404],
+          log: ctx.logger,
+        });
+        if (getResp.status === 404) {
+          const handle = await ctx.writeResource(
+            "board_result",
+            `board-${args.boardId}`,
+            {
+              id: args.boardId,
+              operation: "delete",
+              success: false,
+              httpStatus: 404,
+              error: "board not found",
+            },
+          );
+          return {
+            dataHandles: [handle],
+            methodResult: {
+              id: args.boardId,
+              operation: "delete",
+              success: false,
+              outcome: "not-found",
+            },
+          };
+        }
+        if (!getResp.ok) {
+          throw new Error(
+            `GET /boards/${args.boardId} returned ${getResp.status}: ${
+              clip(getResp.text, 200)
+            }`,
+          );
+        }
+        let raw: Record<string, unknown>;
+        try {
+          raw = JSON.parse(getResp.text);
+        } catch {
+          throw new Error("GET /boards/{id} returned non-JSON response");
+        }
+        const board = parseBoard(raw);
+        const rawStacks = (raw.stacks as Record<string, unknown>[]) ?? [];
+        let totalCards = 0;
+        for (const s of rawStacks) {
+          const rawCards = (s.cards as unknown[]) ?? [];
+          totalCards += rawCards.length;
+        }
+        ctx.logger?.info(
+          "delete_board: board {id} ({title}) has {stackCount} stacks, {cardCount} cards (maxDeletes={maxDeletes})",
+          {
+            id: args.boardId,
+            title: clip(board.title, 80),
+            stackCount: rawStacks.length,
+            cardCount: totalCards,
+            maxDeletes: args.maxDeletes,
+          },
+        );
+        if (totalCards > args.maxDeletes) {
+          const reason =
+            `board contains ${totalCards} cards (maxDeletes=${args.maxDeletes})`;
+          const handle = await ctx.writeResource(
+            "board_result",
+            `board-${args.boardId}`,
+            {
+              id: args.boardId,
+              title: board.title,
+              operation: "delete",
+              success: false,
+              aborted: true,
+              abortReason: reason,
+              cardCount: totalCards,
+            },
+          );
+          return {
+            dataHandles: [handle],
+            methodResult: {
+              id: args.boardId,
+              title: board.title,
+              operation: "delete",
+              success: false,
+              outcome: "aborted",
+              reason,
+              cardCount: totalCards,
+            },
+          };
+        }
+        if (args.dryRun) {
+          const handle = await ctx.writeResource(
+            "board_result",
+            `board-${args.boardId}`,
+            {
+              id: args.boardId,
+              title: board.title,
+              operation: "delete",
+              success: true,
+              dryRun: true,
+              cardCount: totalCards,
+            },
+          );
+          return {
+            dataHandles: [handle],
+            methodResult: {
+              id: args.boardId,
+              title: board.title,
+              operation: "delete",
+              success: true,
+              outcome: "would-delete",
+              cardCount: totalCards,
+            },
+          };
+        }
+        const resp = await davRequest("DELETE", getUrl, auth, {
+          okStatuses: [200, 204, 404],
+          log: ctx.logger,
+        });
+        const outcome = resp.status === 404 ? "not-found" : "deleted";
+        ctx.logger?.info("delete_board: {outcome} board {id}", {
+          outcome,
+          id: args.boardId,
+        });
+        const handle = await ctx.writeResource(
+          "board_result",
+          `board-${args.boardId}`,
+          {
+            id: args.boardId,
+            title: board.title,
+            operation: "delete",
+            success: resp.status !== 404,
+            httpStatus: resp.status,
+            cardCount: totalCards,
+          },
+        );
+        return {
+          dataHandles: [handle],
+          methodResult: {
+            id: args.boardId,
+            title: board.title,
+            operation: "delete",
+            success: resp.status !== 404,
+            outcome,
+            cardCount: totalCards,
+          },
+        };
+      },
+    },
+
+    list_stacks: {
+      description:
+        "List stacks in a Deck board (metadata only; cards not nested). GET /boards/{boardId}/stacks.",
+      arguments: ListStacksArgsSchema,
+      execute: async (
+        args: z.infer<typeof ListStacksArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const url = `${deckBase(g.baseUrl)}/boards/${args.boardId}/stacks`;
+        const resp = await davRequest("GET", url, auth, {
+          headers: { Accept: "application/json", "OCS-APIRequest": "true" },
+          okStatuses: [200, 404],
+          log: ctx.logger,
+        });
+        if (resp.status === 404) {
+          throw new Error(`Board ${args.boardId} not found`);
+        }
+        if (!resp.ok) {
+          throw new Error(
+            `GET /boards/${args.boardId}/stacks returned ${resp.status}: ${
+              clip(resp.text, 200)
+            }`,
+          );
+        }
+        let parsed: unknown[];
+        try {
+          parsed = JSON.parse(resp.text);
+        } catch {
+          throw new Error(
+            "GET /boards/{id}/stacks returned non-JSON response",
+          );
+        }
+        if (!Array.isArray(parsed)) {
+          throw new Error(
+            "GET /boards/{id}/stacks did not return a JSON array",
+          );
+        }
+        const stacks = z.array(StackSchema).parse(parsed).slice(
+          0,
+          DECK_MAX_LIST_ENTRIES,
+        );
+        ctx.logger?.info(
+          "list_stacks: found {count} stacks for board {boardId}",
+          { count: stacks.length, boardId: args.boardId },
+        );
+        const handle = await ctx.writeResource(
+          "stacks",
+          `stacks-${args.boardId}`,
+          { boardId: args.boardId, stacks, count: stacks.length },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    create_stack: {
+      description:
+        "Create a new stack in a Deck board. Returns the created stack's metadata.",
+      arguments: CreateStackArgsSchema,
+      execute: async (
+        args: z.infer<typeof CreateStackArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        validateDeckTitle(args.title);
+        const body = { title: args.title, order: args.order };
+        const url = `${deckBase(g.baseUrl)}/boards/${args.boardId}/stacks`;
+        const resp = await davRequest("POST", url, auth, {
+          body: JSON.stringify(body),
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            "OCS-APIRequest": "true",
+          },
+          okStatuses: [200, 201],
+          log: ctx.logger,
+        });
+        if (!resp.ok) {
+          throw new Error(
+            `POST /boards/${args.boardId}/stacks returned ${resp.status}: ${
+              clip(resp.text, 200)
+            }`,
+          );
+        }
+        let raw: Record<string, unknown>;
+        try {
+          raw = JSON.parse(resp.text);
+        } catch {
+          throw new Error(
+            "POST /boards/{id}/stacks returned non-JSON response",
+          );
+        }
+        const stack = parseStack(raw);
+        ctx.logger?.info(
+          "create_stack: created stack {id} ({title}) on board {boardId}",
+          {
+            id: stack.id,
+            title: clip(stack.title, 80),
+            boardId: args.boardId,
+          },
+        );
+        const handle = await ctx.writeResource(
+          "stack_result",
+          `stack-${stack.id}`,
+          {
+            id: stack.id,
+            title: stack.title,
+            boardId: stack.boardId,
+            operation: "create",
+            success: true,
+            httpStatus: resp.status,
+          },
+        );
+        return {
+          dataHandles: [handle],
+          methodResult: {
+            id: stack.id,
+            title: stack.title,
+            boardId: stack.boardId,
+            order: stack.order,
+            operation: "create",
+            success: true,
+          },
+        };
+      },
+    },
+
+    delete_stack: {
+      description:
+        "Delete a Deck stack. Cascade safety: counts cards in the stack before deleting — aborts if count exceeds maxDeletes (ADV-4). Supports dryRun.",
+      arguments: DeleteStackArgsSchema,
+      execute: async (
+        args: z.infer<typeof DeleteStackArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        // Fetch stack first to count cards (cascade safety).
+        const getUrl = `${deckBase(g.baseUrl)}/stacks/${args.stackId}`;
+        const getResp = await davRequest("GET", getUrl, auth, {
+          headers: { Accept: "application/json", "OCS-APIRequest": "true" },
+          okStatuses: [200, 404],
+          log: ctx.logger,
+        });
+        if (getResp.status === 404) {
+          const handle = await ctx.writeResource(
+            "stack_result",
+            `stack-${args.stackId}`,
+            {
+              id: args.stackId,
+              operation: "delete",
+              success: false,
+              httpStatus: 404,
+              error: "stack not found",
+            },
+          );
+          return {
+            dataHandles: [handle],
+            methodResult: {
+              id: args.stackId,
+              operation: "delete",
+              success: false,
+              outcome: "not-found",
+            },
+          };
+        }
+        if (!getResp.ok) {
+          throw new Error(
+            `GET /stacks/${args.stackId} returned ${getResp.status}: ${
+              clip(getResp.text, 200)
+            }`,
+          );
+        }
+        let raw: Record<string, unknown>;
+        try {
+          raw = JSON.parse(getResp.text);
+        } catch {
+          throw new Error("GET /stacks/{id} returned non-JSON response");
+        }
+        const stack = parseStack(raw);
+        const rawCards = (raw.cards as unknown[]) ?? [];
+        const cardCount = rawCards.length;
+        ctx.logger?.info(
+          "delete_stack: stack {id} ({title}) has {cardCount} cards (maxDeletes={maxDeletes})",
+          {
+            id: args.stackId,
+            title: clip(stack.title, 80),
+            cardCount,
+            maxDeletes: args.maxDeletes,
+          },
+        );
+        if (cardCount > args.maxDeletes) {
+          const reason =
+            `stack contains ${cardCount} cards (maxDeletes=${args.maxDeletes})`;
+          const handle = await ctx.writeResource(
+            "stack_result",
+            `stack-${args.stackId}`,
+            {
+              id: args.stackId,
+              title: stack.title,
+              boardId: stack.boardId,
+              operation: "delete",
+              success: false,
+              aborted: true,
+              abortReason: reason,
+              cardCount,
+            },
+          );
+          return {
+            dataHandles: [handle],
+            methodResult: {
+              id: args.stackId,
+              title: stack.title,
+              operation: "delete",
+              success: false,
+              outcome: "aborted",
+              reason,
+              cardCount,
+            },
+          };
+        }
+        if (args.dryRun) {
+          const handle = await ctx.writeResource(
+            "stack_result",
+            `stack-${args.stackId}`,
+            {
+              id: args.stackId,
+              title: stack.title,
+              boardId: stack.boardId,
+              operation: "delete",
+              success: true,
+              dryRun: true,
+              cardCount,
+            },
+          );
+          return {
+            dataHandles: [handle],
+            methodResult: {
+              id: args.stackId,
+              title: stack.title,
+              operation: "delete",
+              success: true,
+              outcome: "would-delete",
+              cardCount,
+            },
+          };
+        }
+        const resp = await davRequest("DELETE", getUrl, auth, {
+          okStatuses: [200, 204, 404],
+          log: ctx.logger,
+        });
+        const outcome = resp.status === 404 ? "not-found" : "deleted";
+        ctx.logger?.info("delete_stack: {outcome} stack {id}", {
+          outcome,
+          id: args.stackId,
+        });
+        const handle = await ctx.writeResource(
+          "stack_result",
+          `stack-${args.stackId}`,
+          {
+            id: args.stackId,
+            title: stack.title,
+            boardId: stack.boardId,
+            operation: "delete",
+            success: resp.status !== 404,
+            httpStatus: resp.status,
+            cardCount,
+          },
+        );
+        return {
+          dataHandles: [handle],
+          methodResult: {
+            id: args.stackId,
+            title: stack.title,
+            operation: "delete",
+            success: resp.status !== 404,
+            outcome,
+            cardCount,
+          },
+        };
+      },
+    },
+
+    list_cards: {
+      description:
+        "List cards in a Deck stack (metadata only — descriptions NEVER persisted, PII). GET /stacks/{stackId}.",
+      arguments: ListCardsArgsSchema,
+      execute: async (
+        args: z.infer<typeof ListCardsArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const url = `${deckBase(g.baseUrl)}/stacks/${args.stackId}`;
+        const resp = await davRequest("GET", url, auth, {
+          headers: { Accept: "application/json", "OCS-APIRequest": "true" },
+          okStatuses: [200, 404],
+          log: ctx.logger,
+        });
+        if (resp.status === 404) {
+          throw new Error(`Stack ${args.stackId} not found`);
+        }
+        if (!resp.ok) {
+          throw new Error(
+            `GET /stacks/${args.stackId} returned ${resp.status}: ${
+              clip(resp.text, 200)
+            }`,
+          );
+        }
+        let raw: Record<string, unknown>;
+        try {
+          raw = JSON.parse(resp.text);
+        } catch {
+          throw new Error("GET /stacks/{id} returned non-JSON response");
+        }
+        const rawCards = (raw.cards as Record<string, unknown>[]) ?? [];
+        const cards = rawCards
+          .map((c) => parseCard(c))
+          .slice(0, DECK_MAX_LIST_ENTRIES);
+        const withProv = cards.filter((c) => c.hasProvenance).length;
+        ctx.logger?.info(
+          "list_cards: found {count} cards in stack {stackId} ({withProv} swamp-managed)",
+          { count: cards.length, stackId: args.stackId, withProv },
+        );
+        const handle = await ctx.writeResource(
+          "cards",
+          `cards-${args.stackId}`,
+          { stackId: args.stackId, cards, count: cards.length },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    create_card: {
+      description:
+        "Create a new card in a Deck stack. Auto-assigns the swamp-managed provenance label (SEC-1) — creates the label on the board if missing. Description is sent to the API but NEVER persisted (PII).",
+      arguments: CreateCardArgsSchema,
+      execute: async (
+        args: z.infer<typeof CreateCardArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        validateDeckTitle(args.title);
+        if (args.description) {
+          checkDeckXss(args.description, "Deck description");
+          if (args.description.length > DECK_MAX_DESCRIPTION_SIZE) {
+            throw new Error(
+              `description exceeds ${DECK_MAX_DESCRIPTION_SIZE} chars`,
+            );
+          }
+        }
+        // Step 1: resolve stack → boardId.
+        const stackUrl = `${deckBase(g.baseUrl)}/stacks/${args.stackId}`;
+        const stackResp = await davRequest("GET", stackUrl, auth, {
+          headers: { Accept: "application/json", "OCS-APIRequest": "true" },
+          okStatuses: [200, 404],
+          log: ctx.logger,
+        });
+        if (stackResp.status === 404) {
+          throw new Error(`Stack ${args.stackId} not found`);
+        }
+        if (!stackResp.ok) {
+          throw new Error(
+            `GET /stacks/${args.stackId} returned ${stackResp.status}: ${
+              clip(stackResp.text, 200)
+            }`,
+          );
+        }
+        let stackRaw: Record<string, unknown>;
+        try {
+          stackRaw = JSON.parse(stackResp.text);
+        } catch {
+          throw new Error("GET /stacks/{id} returned non-JSON response");
+        }
+        const boardId = (stackRaw.boardId as number) ??
+          (stackRaw.board_id as number);
+        if (!boardId) {
+          throw new Error(
+            `GET /stacks/${args.stackId}: could not resolve boardId`,
+          );
+        }
+        // Step 2: ensure provenance label exists on the board.
+        const boardUrl = `${deckBase(g.baseUrl)}/boards/${boardId}`;
+        const boardResp = await davRequest("GET", boardUrl, auth, {
+          headers: { Accept: "application/json", "OCS-APIRequest": "true" },
+          okStatuses: [200, 404],
+          log: ctx.logger,
+        });
+        let labelId: number | undefined;
+        if (boardResp.ok) {
+          try {
+            const boardRaw = JSON.parse(boardResp.text) as Record<
+              string,
+              unknown
+            >;
+            const labels = (boardRaw.labels as Record<string, unknown>[]) ?? [];
+            const existing = labels.find(
+              (l) => l.title === DECK_PROVENANCE_LABEL,
+            );
+            labelId = existing?.id as number | undefined;
+          } catch {
+            // ignore — we'll try to create the label and let the API reject
+          }
+        }
+        if (labelId === undefined) {
+          // Create the provenance label on the board.
+          const labelUrl = `${deckBase(g.baseUrl)}/boards/${boardId}/labels`;
+          const labelResp = await davRequest("POST", labelUrl, auth, {
+            body: JSON.stringify({
+              title: DECK_PROVENANCE_LABEL,
+              color: DECK_PROVENANCE_COLOR,
+            }),
+            headers: {
+              Accept: "application/json",
+              "Content-Type": "application/json",
+              "OCS-APIRequest": "true",
+            },
+            okStatuses: [200, 201],
+            log: ctx.logger,
+          });
+          if (labelResp.ok) {
+            try {
+              const labelRaw = JSON.parse(labelResp.text) as Record<
+                string,
+                unknown
+              >;
+              labelId = labelRaw.id as number;
+            } catch {
+              // proceed without label assignment
+            }
+          }
+        }
+        // Step 3: create the card.
+        const cardUrl = `${deckBase(g.baseUrl)}/stacks/${args.stackId}/cards`;
+        const cardBody: Record<string, unknown> = {
+          title: args.title,
+          description: args.description ?? "",
+        };
+        if (args.order !== undefined) cardBody.order = args.order;
+        const cardResp = await davRequest("POST", cardUrl, auth, {
+          body: JSON.stringify(cardBody),
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            "OCS-APIRequest": "true",
+          },
+          okStatuses: [200, 201],
+          log: ctx.logger,
+        });
+        if (!cardResp.ok) {
+          throw new Error(
+            `POST /stacks/${args.stackId}/cards returned ${cardResp.status}: ${
+              clip(cardResp.text, 200)
+            }`,
+          );
+        }
+        let cardRaw: Record<string, unknown>;
+        try {
+          cardRaw = JSON.parse(cardResp.text);
+        } catch {
+          throw new Error("POST /stacks/{id}/cards returned non-JSON response");
+        }
+        const cardId = cardRaw.id as number;
+        // Step 4: assign the provenance label (if we have a labelId).
+        let hasProvenance = false;
+        if (labelId !== undefined && cardId !== undefined) {
+          const assignUrl = `${
+            deckBase(g.baseUrl)
+          }/cards/${cardId}/assignLabel`;
+          const assignResp = await davRequest("PUT", assignUrl, auth, {
+            body: JSON.stringify({ id: labelId }),
+            headers: {
+              Accept: "application/json",
+              "Content-Type": "application/json",
+              "OCS-APIRequest": "true",
+            },
+            okStatuses: [200, 201, 202],
+            log: ctx.logger,
+          });
+          hasProvenance = assignResp.ok;
+        }
+        ctx.logger?.info(
+          "create_card: created card {id} ({title}) in stack {stackId} (provenance={provenance})",
+          {
+            id: cardId,
+            title: clip(args.title, 80),
+            stackId: args.stackId,
+            provenance: hasProvenance,
+          },
+        );
+        const handle = await ctx.writeResource(
+          "card_result",
+          `card-${cardId}`,
+          {
+            id: cardId,
+            title: args.title,
+            stackId: args.stackId,
+            operation: "create",
+            success: true,
+            httpStatus: cardResp.status,
+            hasProvenance,
+          },
+        );
+        return {
+          dataHandles: [handle],
+          methodResult: {
+            id: cardId,
+            title: args.title,
+            stackId: args.stackId,
+            operation: "create",
+            success: true,
+            hasProvenance,
+          },
+        };
+      },
+    },
+
+    update_card: {
+      description:
+        "Update a card's title and/or description. Description is NEVER persisted (PII). Provenance label is preserved by Deck automatically.",
+      arguments: UpdateCardArgsSchema,
+      execute: async (
+        args: z.infer<typeof UpdateCardArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        validateDeckTitle(args.title);
+        if (args.description) {
+          checkDeckXss(args.description, "Deck description");
+          if (args.description.length > DECK_MAX_DESCRIPTION_SIZE) {
+            throw new Error(
+              `description exceeds ${DECK_MAX_DESCRIPTION_SIZE} chars`,
+            );
+          }
+        }
+        const url = `${deckBase(g.baseUrl)}/cards/${args.cardId}`;
+        const body: Record<string, unknown> = {
+          title: args.title,
+          description: args.description ?? "",
+        };
+        if (args.order !== undefined) body.order = args.order;
+        const headers: Record<string, string> = {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "OCS-APIRequest": "true",
+        };
+        if (args.etag) headers["If-Match"] = args.etag;
+        const resp = await davRequest("PUT", url, auth, {
+          body: JSON.stringify(body),
+          headers,
+          okStatuses: [200, 404, 412],
+          log: ctx.logger,
+        });
+        if (resp.status === 404) {
+          throw new Error(`Card ${args.cardId} not found`);
+        }
+        if (resp.status === 412) {
+          const handle = await ctx.writeResource(
+            "card_result",
+            `card-${args.cardId}`,
+            {
+              id: args.cardId,
+              title: args.title,
+              operation: "update",
+              success: false,
+              error: "conflict (ETag mismatch)",
+            },
+          );
+          return {
+            dataHandles: [handle],
+            methodResult: {
+              id: args.cardId,
+              title: args.title,
+              operation: "update",
+              success: false,
+              outcome: "conflict",
+            },
+          };
+        }
+        if (!resp.ok) {
+          throw new Error(
+            `PUT /cards/${args.cardId} returned ${resp.status}: ${
+              clip(resp.text, 200)
+            }`,
+          );
+        }
+        let raw: Record<string, unknown>;
+        try {
+          raw = JSON.parse(resp.text);
+        } catch {
+          throw new Error("PUT /cards/{id} returned non-JSON response");
+        }
+        const card = parseCard(raw);
+        ctx.logger?.info("update_card: updated card {id} ({title})", {
+          id: card.id,
+          title: clip(card.title, 80),
+        });
+        const handle = await ctx.writeResource(
+          "card_result",
+          `card-${args.cardId}`,
+          {
+            id: card.id,
+            title: card.title,
+            stackId: card.stackId,
+            operation: "update",
+            success: true,
+            httpStatus: resp.status,
+            hasProvenance: card.hasProvenance,
+          },
+        );
+        return {
+          dataHandles: [handle],
+          methodResult: {
+            id: card.id,
+            title: card.title,
+            stackId: card.stackId,
+            operation: "update",
+            success: true,
+            hasProvenance: card.hasProvenance,
+          },
+        };
+      },
+    },
+
+    delete_card: {
+      description:
+        "Delete a Deck card. When requireProvenance=true (default), refuses to delete cards that lack the swamp-managed label (SEC-1). Supports dryRun.",
+      arguments: DeleteCardArgsSchema,
+      execute: async (
+        args: z.infer<typeof DeleteCardArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const getUrl = `${deckBase(g.baseUrl)}/cards/${args.cardId}`;
+        // Pre-flight: fetch card for provenance check + dryRun.
+        const getResp = await davRequest("GET", getUrl, auth, {
+          headers: { Accept: "application/json", "OCS-APIRequest": "true" },
+          okStatuses: [200, 404],
+          log: ctx.logger,
+        });
+        if (getResp.status === 404) {
+          const handle = await ctx.writeResource(
+            "card_result",
+            `card-${args.cardId}`,
+            {
+              id: args.cardId,
+              operation: "delete",
+              success: false,
+              httpStatus: 404,
+              error: "card not found",
+            },
+          );
+          return {
+            dataHandles: [handle],
+            methodResult: {
+              id: args.cardId,
+              operation: "delete",
+              success: false,
+              outcome: "not-found",
+            },
+          };
+        }
+        if (!getResp.ok) {
+          throw new Error(
+            `GET /cards/${args.cardId} returned ${getResp.status}: ${
+              clip(getResp.text, 200)
+            }`,
+          );
+        }
+        let raw: Record<string, unknown>;
+        try {
+          raw = JSON.parse(getResp.text);
+        } catch {
+          throw new Error("GET /cards/{id} returned non-JSON response");
+        }
+        const card = parseCard(raw);
+        if (args.requireProvenance && !card.hasProvenance) {
+          const handle = await ctx.writeResource(
+            "card_result",
+            `card-${args.cardId}`,
+            {
+              id: args.cardId,
+              title: card.title,
+              stackId: card.stackId,
+              operation: "delete",
+              success: false,
+              error:
+                "refused: card lacks swamp-managed provenance label (SEC-1)",
+              hasProvenance: false,
+            },
+          );
+          return {
+            dataHandles: [handle],
+            methodResult: {
+              id: args.cardId,
+              title: card.title,
+              operation: "delete",
+              success: false,
+              outcome: "refused-no-provenance",
+              hasProvenance: false,
+            },
+          };
+        }
+        if (args.dryRun) {
+          const handle = await ctx.writeResource(
+            "card_result",
+            `card-${args.cardId}`,
+            {
+              id: args.cardId,
+              title: card.title,
+              stackId: card.stackId,
+              operation: "delete",
+              success: true,
+              dryRun: true,
+              hasProvenance: card.hasProvenance,
+            },
+          );
+          return {
+            dataHandles: [handle],
+            methodResult: {
+              id: args.cardId,
+              title: card.title,
+              operation: "delete",
+              success: true,
+              outcome: "would-delete",
+              hasProvenance: card.hasProvenance,
+            },
+          };
+        }
+        const resp = await davRequest("DELETE", getUrl, auth, {
+          okStatuses: [200, 204, 404],
+          log: ctx.logger,
+        });
+        const outcome = resp.status === 404 ? "not-found" : "deleted";
+        ctx.logger?.info("delete_card: {outcome} card {id}", {
+          outcome,
+          id: args.cardId,
+        });
+        const handle = await ctx.writeResource(
+          "card_result",
+          `card-${args.cardId}`,
+          {
+            id: args.cardId,
+            title: card.title,
+            stackId: card.stackId,
+            operation: "delete",
+            success: resp.status !== 404,
+            httpStatus: resp.status,
+            hasProvenance: card.hasProvenance,
+          },
+        );
+        return {
+          dataHandles: [handle],
+          methodResult: {
+            id: args.cardId,
+            title: card.title,
+            operation: "delete",
+            success: resp.status !== 404,
+            outcome,
+            hasProvenance: card.hasProvenance,
           },
         };
       },
