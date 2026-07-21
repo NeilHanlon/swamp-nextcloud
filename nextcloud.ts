@@ -641,7 +641,12 @@ export function fnv1a(input: string): string {
   return (h >>> 0).toString(16).padStart(8, "0");
 }
 
-type DavResponse = { status: number; ok: boolean; text: string };
+type DavResponse = {
+  status: number;
+  ok: boolean;
+  text: string;
+  headers: Record<string, string>;
+};
 
 /**
  * Issue a DAV/OCS request. Logs only method + path + status + byte count —
@@ -671,6 +676,11 @@ async function davRequest(
     signal: AbortSignal.timeout(30_000),
   });
   const text = await resp.text();
+  // Extract response headers as a simple key-value map (lowercase keys).
+  const respHeaders: Record<string, string> = {};
+  resp.headers.forEach((v, k) => {
+    respHeaders[k.toLowerCase()] = v;
+  });
   log?.debug("{method} {path} -> {status} ({bytes} bytes)", {
     method,
     path,
@@ -694,7 +704,7 @@ async function davRequest(
       }`,
     );
   }
-  return { status: resp.status, ok: resp.ok, text };
+  return { status: resp.status, ok: resp.ok, text, headers: respHeaders };
 }
 
 /** Strip query/userinfo from a URL for safe logging. */
@@ -2283,7 +2293,7 @@ export const PutFileArgsSchema = z.object({
     .describe("File content to upload. Never persisted or logged (PII)."),
   contentType: z
     .string()
-    .default("application/octet-stream")
+    .default("text/plain")
     .describe("MIME type of the file. Must be in the allowlist (SEC-3)."),
   ifMatch: z
     .string()
@@ -4559,8 +4569,7 @@ export const model = {
             },
           };
         }
-        const etag = resp.text.match(/etag["']?\s*:\s*["']([^"']+)/i)?.[1] ??
-          undefined;
+        const etag = resp.headers["etag"] ?? undefined;
         ctx.logger?.info("put_file: uploaded {path} ({size} bytes)", {
           path: clip(validatedPath, 120),
           size: bodyBytes,

@@ -1750,7 +1750,7 @@ Deno.test("GetFileArgsSchema requires a path", () => {
 
 Deno.test("PutFileArgsSchema defaults contentType and has no ifMatch", () => {
   const args = PutFileArgsSchema.parse({ path: "f.txt", body: "hello" });
-  assertEquals(args.contentType, "application/octet-stream");
+  assertEquals(args.contentType, "text/plain");
   assertEquals(args.ifMatch, undefined);
 });
 
