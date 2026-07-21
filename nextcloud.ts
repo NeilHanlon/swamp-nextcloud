@@ -6862,7 +6862,7 @@ export const model = {
 
     delete_user: {
       description:
-        "Delete a user via OCS Users API (admin only). Triple safety: confirmUserId must match userid, maxDeletes cap, dryRun mode. Refuses to delete admin account. Only operates on swamp-managed users (provenance check).",
+        "Delete a user via OCS Users API (admin only). Triple safety: confirmUserId must match userid, maxDeletes cap, dryRun mode. Refuses to delete admin account.",
       arguments: DeleteUserArgsSchema,
       execute: async (
         args: z.infer<typeof DeleteUserArgsSchema>,
