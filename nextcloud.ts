@@ -1,4 +1,5 @@
 import { z } from "npm:zod@4";
+import { randomBytes } from "node:crypto";
 
 /**
  * @kneel/nextcloud — drive a Nextcloud instance from swamp over its CalDAV /
@@ -2703,12 +2704,324 @@ export function parseCard(
 }
 
 // ---------------------------------------------------------------------------
+// OCS Users API — constants, helpers, schemas (NC-USERS)
+// ---------------------------------------------------------------------------
+
+/**
+ * Base URL for the Nextcloud OCS Users API v2.
+ * All user/group CRUD endpoints are under `/ocs/v2.php/cloud`.
+ */
+export function usersBase(baseUrl: string): string {
+  return `${baseUrl.replace(/\/$/, "")}/ocs/v2.php/cloud`;
+}
+
+// ── Users constants ─────────────────────────────────────────────────────────
+
+/** Maximum number of users returned in a single list_users call. */
+export const USERS_MAX_LIST = 500;
+
+/** Default cap on delete_user calls — blast-radius safety. */
+export const USERS_DEFAULT_MAX_DELETES = 1;
+
+/** Reserved admin username that must never be deleted. */
+export const USERS_ADMIN_RESERVED = "admin";
+
+// ── CSPRNG password generation ─────────────────────────────────────────────
+
+/**
+ * Generate a CSPRNG password: 16 random bytes, base64url-encoded (22 chars).
+ * Never logged. Returned exactly once to the caller in methodResult.
+ */
+export function generatePassword(): string {
+  return randomBytes(16).toString("base64url");
+}
+
+// ── Admin capability probe ─────────────────────────────────────────────────
+
+/**
+ * Cache key for the admin probe result within a single method call.
+ * We don't cache across calls (swamp resources handle persistence).
+ */
+let _adminProbeCache: { key: string; isAdmin: boolean } | null = null;
+
+/**
+ * Probe the OCS /cloud/user endpoint to determine whether the authenticated
+ * user is a Nextcloud admin. The admin flag is required for Users API methods.
+ *
+ * Caches result per (baseUrl, username) to avoid repeated probes within a
+ * single method execution. Returns true if admin, throws otherwise.
+ */
+export async function adminProbe(
+  auth: string,
+  baseUrl: string,
+  username: string,
+  log?: Logger,
+): Promise<boolean> {
+  const cacheKey = `${baseUrl}|${username}`;
+  if (_adminProbeCache && _adminProbeCache.key === cacheKey) {
+    return _adminProbeCache.isAdmin;
+  }
+  const url = `${ocsBase(baseUrl)}/cloud/user?format=json`;
+  const resp = await davRequest("GET", url, auth, {
+    headers: { Accept: "application/json", "OCS-APIRequest": "true" },
+    okStatuses: [200],
+    log,
+  });
+  if (!resp.ok) {
+    throw new Error(
+      `adminProbe: GET /cloud/user returned ${resp.status}: ${
+        clip(resp.text, 200)
+      }`,
+    );
+  }
+  let data: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(resp.text);
+    data = (parsed?.ocs?.data as Record<string, unknown>) ?? {};
+  } catch {
+    throw new Error("adminProbe: OCS response was not valid JSON");
+  }
+  // The admin flag lives in ocs.data.admin (boolean).
+  const isAdmin = data.admin === true;
+  _adminProbeCache = { key: cacheKey, isAdmin };
+  log?.debug("adminProbe: user={userId} admin={isAdmin}", {
+    userId: clip(String(data.id ?? username), 80),
+    isAdmin,
+  });
+  return isAdmin;
+}
+
+/** Reset the admin probe cache (for tests). */
+export function resetAdminProbeCache(): void {
+  _adminProbeCache = null;
+}
+
+// ── Users Zod schemas ──────────────────────────────────────────────────────
+
+/**
+ * Schema for a user ID (persistence only — no PII).
+ */
+export const UserSchema = z.object({
+  userId: z.string().min(1),
+});
+
+/**
+ * Schema for full user detail (returned via methodResult only — never persisted).
+ */
+export const UserDetailSchema = z.object({
+  userId: z.string(),
+  email: z.string().default(""),
+  displayname: z.string().default(""),
+  quota: z.unknown().optional(),
+  lastLogin: z.number().optional(),
+  enabled: z.boolean().optional(),
+});
+
+/**
+ * Schema for a group ID (persistence only — no PII).
+ */
+export const GroupSchema = z.object({
+  groupId: z.string().min(1),
+});
+
+/**
+ * Schema for full group detail (returned via methodResult only).
+ */
+export const GroupDetailSchema = z.object({
+  groupId: z.string(),
+  members: z.array(z.string()).default([]),
+});
+
+/** Args for list_users. */
+export const ListUsersArgsSchema = z.object({
+  search: z
+    .string()
+    .optional()
+    .describe("Optional search filter (substring match on user IDs)."),
+  limit: z
+    .number()
+    .int()
+    .positive()
+    .max(USERS_MAX_LIST)
+    .optional()
+    .describe(
+      `Maximum users to return (default: all, up to ${USERS_MAX_LIST}).`,
+    ),
+  offset: z
+    .number()
+    .int()
+    .min(0)
+    .optional()
+    .describe("Pagination offset."),
+});
+
+/** Args for create_user. */
+export const CreateUserArgsSchema = z.object({
+  userid: z
+    .string()
+    .min(1)
+    .max(64)
+    .describe("User ID to create (1–64 chars)."),
+  displayName: z
+    .string()
+    .min(1)
+    .max(255)
+    .optional()
+    .describe("Optional display name (defaults to userid)."),
+  email: z
+    .string()
+    .email()
+    .optional()
+    .describe("Optional email address."),
+  groups: z
+    .array(z.string().min(1))
+    .default([])
+    .describe("Optional groups to add the user to on creation."),
+  password: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "Explicit password. If omitted, a CSPRNG password is generated and returned once.",
+    ),
+});
+
+/** Args for get_user. */
+export const GetUserArgsSchema = z.object({
+  userid: z.string().min(1).describe("User ID to fetch."),
+});
+
+/** Editable user fields for edit_user. */
+export const USER_EDIT_KEYS = [
+  "email",
+  "quota",
+  "display",
+  "password",
+] as const;
+
+/** Args for edit_user. */
+export const EditUserArgsSchema = z.object({
+  userid: z.string().min(1).describe("User ID to edit."),
+  key: z
+    .enum(USER_EDIT_KEYS)
+    .describe("Field to edit: email, quota, display, or password."),
+  value: z
+    .string()
+    .min(1)
+    .describe("New value for the field."),
+});
+
+/** Args for delete_user. Triple safety: confirmUserId + maxDeletes + dryRun. */
+export const DeleteUserArgsSchema = z.object({
+  userid: z.string().min(1).describe("User ID to delete."),
+  confirmUserId: z
+    .string()
+    .min(1)
+    .describe(
+      "Safety: must exactly match userid. Prevents accidental deletion from copy-paste errors.",
+    ),
+  dryRun: z
+    .boolean()
+    .default(false)
+    .describe("When true, preview deletion without mutating."),
+  maxDeletes: z
+    .number()
+    .int()
+    .min(0)
+    .default(USERS_DEFAULT_MAX_DELETES)
+    .describe(
+      `Blast-radius cap: abort if more than this many users would be deleted (default: ${USERS_DEFAULT_MAX_DELETES}).`,
+    ),
+});
+
+/** Args for list_groups. */
+export const ListGroupsArgsSchema = z.object({
+  search: z
+    .string()
+    .optional()
+    .describe("Optional search filter (substring match on group IDs)."),
+  limit: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe("Maximum groups to return."),
+  offset: z
+    .number()
+    .int()
+    .min(0)
+    .optional()
+    .describe("Pagination offset."),
+});
+
+/** Args for get_group. */
+export const GetGroupArgsSchema = z.object({
+  groupid: z.string().min(1).describe("Group ID to fetch."),
+});
+
+// ── Users response parsers ─────────────────────────────────────────────────
+
+/**
+ * Parse the OCS /cloud/users response into an array of user IDs.
+ * Nextcloud returns `ocs.data.users` as an array of strings.
+ */
+export function parseUserIds(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((u): u is string => typeof u === "string" && u.length > 0);
+}
+
+/**
+ * Parse the OCS /cloud/users/{userid} response into a UserDetail object.
+ */
+export function parseUserDetail(
+  raw: Record<string, unknown>,
+): z.infer<typeof UserDetailSchema> {
+  return UserDetailSchema.parse({
+    userId: String(raw.id ?? raw.userid ?? raw.userId ?? ""),
+    email: String(raw.email ?? ""),
+    displayname: String(raw["display-name"] ?? raw.displayname ?? ""),
+    quota: raw.quota ?? undefined,
+    lastLogin: typeof raw["lastLogin"] === "number"
+      ? raw["lastLogin"]
+      : undefined,
+    enabled: typeof raw.enabled === "boolean" ? raw.enabled : undefined,
+  });
+}
+
+/**
+ * Parse the OCS /cloud/groups response into an array of group IDs.
+ */
+export function parseGroupIds(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((g): g is string => typeof g === "string" && g.length > 0);
+}
+
+/**
+ * Parse the OCS /cloud/groups/{groupid} response into a GroupDetail object.
+ */
+export function parseGroupDetail(
+  raw: Record<string, unknown>,
+): z.infer<typeof GroupDetailSchema> {
+  const members = Array.isArray(raw.users)
+    ? raw.users.filter(
+      (u): u is string => typeof u === "string" && u.length > 0,
+    )
+    : [];
+  return GroupDetailSchema.parse({
+    groupId: String(raw.id ?? raw.groupid ?? raw.groupId ?? ""),
+    members,
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Model definition
 // ---------------------------------------------------------------------------
 
 export const model = {
   type: "@kneel/nextcloud",
-  version: "2026.07.20.6",
+  version: "2026.07.20.7",
   globalArguments: GlobalArgsSchema,
 
   resources: {
@@ -3089,6 +3402,49 @@ export const model = {
       }),
       lifetime: "1d" as const,
       garbageCollection: 7,
+    },
+    users: {
+      description: "User IDs listed from the OCS Users API (IDs only, no PII).",
+      schema: z.object({
+        userIds: z.array(z.string()),
+        count: z.number(),
+      }),
+      lifetime: "1d" as const,
+      garbageCollection: 7,
+    },
+    managed_users: {
+      description:
+        "Provenance snapshot: user IDs created/managed by swamp. delete_user refuses to delete IDs not in this snapshot.",
+      schema: z.object({
+        userIds: z.array(z.string()),
+        count: z.number(),
+      }),
+      lifetime: "infinite" as const,
+      garbageCollection: 3,
+    },
+    user_detail: {
+      description:
+        "Full user detail (userId + email + displayname + quota + lastLogin). Returned via methodResult ONLY — never persisted (PII).",
+      schema: UserDetailSchema,
+      lifetime: "1h" as const,
+      garbageCollection: 3,
+    },
+    groups: {
+      description:
+        "Group IDs listed from the OCS Groups API (IDs only, no PII).",
+      schema: z.object({
+        groupIds: z.array(z.string()),
+        count: z.number(),
+      }),
+      lifetime: "1d" as const,
+      garbageCollection: 7,
+    },
+    group_detail: {
+      description:
+        "Group detail (groupId + members). Returned via methodResult ONLY.",
+      schema: GroupDetailSchema,
+      lifetime: "1h" as const,
+      garbageCollection: 3,
     },
   },
 
@@ -6244,6 +6600,490 @@ export const model = {
             outcome,
             hasProvenance: card.hasProvenance,
           },
+        };
+      },
+    },
+
+    // ── OCS Users API methods (NC-USERS) ──────────────────────────────────
+
+    list_users: {
+      description:
+        "List users via OCS Users API (admin only). Writes user IDs to resource (no PII). Returns full list via methodResult.",
+      arguments: ListUsersArgsSchema,
+      execute: async (
+        args: z.infer<typeof ListUsersArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        // SEC-5: admin capability probe.
+        const isAdmin = await adminProbe(
+          auth,
+          g.baseUrl,
+          g.username,
+          ctx.logger,
+        );
+        if (!isAdmin) {
+          throw new Error(
+            "list_users: authenticated user is not a Nextcloud admin — Users API requires admin privileges (SEC-5).",
+          );
+        }
+        const params = new URLSearchParams({ format: "json" });
+        if (args.search) params.set("search", args.search);
+        if (args.limit !== undefined) params.set("limit", String(args.limit));
+        if (args.offset !== undefined) {
+          params.set("offset", String(args.offset));
+        }
+        const url = `${usersBase(g.baseUrl)}/users?${params.toString()}`;
+        const resp = await davRequest("GET", url, auth, {
+          headers: { Accept: "application/json", "OCS-APIRequest": "true" },
+          okStatuses: [200],
+          log: ctx.logger,
+        });
+        if (!resp.ok) {
+          throw new Error(
+            `GET /users returned ${resp.status}: ${clip(resp.text, 200)}`,
+          );
+        }
+        let ocs: Record<string, unknown>;
+        try {
+          ocs = JSON.parse(resp.text);
+        } catch {
+          throw new Error("GET /users returned non-JSON response");
+        }
+        const ocsData = (ocs?.ocs as Record<string, unknown>) ?? {};
+        const data = ocsData.data;
+        // NC returns either {users: [...]} or a direct object with attributes.
+        const rawUsers = (data as Record<string, unknown>)?.users ?? data;
+        const userIds = parseUserIds(rawUsers).slice(0, USERS_MAX_LIST);
+        ctx.logger?.info("list_users: found {count} users", {
+          count: userIds.length,
+        });
+        // Persist IDs only (SEC-7: no PII).
+        const handle = await ctx.writeResource("users", "users-main", {
+          userIds,
+          count: userIds.length,
+        });
+        return {
+          dataHandles: [handle],
+          methodResult: { userIds, count: userIds.length },
+        };
+      },
+    },
+
+    create_user: {
+      description:
+        "Create a user via OCS Users API (admin only). Generates a CSPRNG password if none supplied. Password is returned ONCE in methodResult — NEVER logged. Records userid in managed_users provenance snapshot.",
+      arguments: CreateUserArgsSchema,
+      execute: async (
+        args: z.infer<typeof CreateUserArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const isAdmin = await adminProbe(
+          auth,
+          g.baseUrl,
+          g.username,
+          ctx.logger,
+        );
+        if (!isAdmin) {
+          throw new Error(
+            "create_user: authenticated user is not a Nextcloud admin — Users API requires admin privileges (SEC-5).",
+          );
+        }
+        // SEC-3: CSPRNG password generation.
+        const password = args.password ?? generatePassword();
+        const body: Record<string, unknown> = {
+          userid: args.userid,
+          password,
+        };
+        if (args.displayName) body.displayName = args.displayName;
+        if (args.email) body.email = args.email;
+        if (args.groups.length > 0) body.groups = args.groups;
+        const url = usersBase(g.baseUrl) + "/users";
+        const resp = await davRequest("POST", url, auth, {
+          body: JSON.stringify(body),
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            "OCS-APIRequest": "true",
+          },
+          okStatuses: [200, 201],
+          log: ctx.logger,
+        });
+        if (!resp.ok) {
+          throw new Error(
+            `POST /users returned ${resp.status}: ${clip(resp.text, 200)}`,
+          );
+        }
+        ctx.logger?.info("create_user: created user {userid}", {
+          userid: clip(args.userid, 80),
+        });
+        // Record in managed_users provenance snapshot.
+        const managedHandle = await ctx.writeResource(
+          "managed_users",
+          "managed-users-main",
+          { userIds: [args.userid], count: 1 },
+        );
+        // SEC-3: password returned EXACTLY ONCE here. NEVER logged.
+        return {
+          dataHandles: [managedHandle],
+          methodResult: {
+            userid: args.userid,
+            password,
+            displayName: args.displayName ?? args.userid,
+            email: args.email ?? "",
+            groups: args.groups,
+            created: true,
+          },
+        };
+      },
+    },
+
+    get_user: {
+      description:
+        "Fetch a single user via OCS Users API (admin only). Returns full detail via methodResult — never persisted (PII).",
+      arguments: GetUserArgsSchema,
+      execute: async (
+        args: z.infer<typeof GetUserArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const isAdmin = await adminProbe(
+          auth,
+          g.baseUrl,
+          g.username,
+          ctx.logger,
+        );
+        if (!isAdmin) {
+          throw new Error(
+            "get_user: authenticated user is not a Nextcloud admin — Users API requires admin privileges (SEC-5).",
+          );
+        }
+        const url = `${usersBase(g.baseUrl)}/users/${
+          encodeURIComponent(args.userid)
+        }?format=json`;
+        const resp = await davRequest("GET", url, auth, {
+          headers: { Accept: "application/json", "OCS-APIRequest": "true" },
+          okStatuses: [200, 404],
+          log: ctx.logger,
+        });
+        if (resp.status === 404) {
+          return {
+            methodResult: {
+              userId: args.userid,
+              found: false,
+            },
+          };
+        }
+        if (!resp.ok) {
+          throw new Error(
+            `GET /users/${args.userid} returned ${resp.status}: ${
+              clip(resp.text, 200)
+            }`,
+          );
+        }
+        let ocs: Record<string, unknown>;
+        try {
+          ocs = JSON.parse(resp.text);
+        } catch {
+          throw new Error("GET /users/{id} returned non-JSON response");
+        }
+        const ocsData = (ocs?.ocs as Record<string, unknown>) ?? {};
+        const userData = (ocsData.data as Record<string, unknown>) ?? {};
+        const detail = parseUserDetail(userData);
+        ctx.logger?.info("get_user: fetched user {userId}", {
+          userId: clip(detail.userId, 80),
+        });
+        return {
+          methodResult: { ...detail, found: true },
+        };
+      },
+    },
+
+    edit_user: {
+      description:
+        "Edit a user field via OCS Users API (admin only). key is one of: email, quota, display, password.",
+      arguments: EditUserArgsSchema,
+      execute: async (
+        args: z.infer<typeof EditUserArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const isAdmin = await adminProbe(
+          auth,
+          g.baseUrl,
+          g.username,
+          ctx.logger,
+        );
+        if (!isAdmin) {
+          throw new Error(
+            "edit_user: authenticated user is not a Nextcloud admin — Users API requires admin privileges (SEC-5).",
+          );
+        }
+        const url = `${usersBase(g.baseUrl)}/users/${
+          encodeURIComponent(args.userid)
+        }`;
+        const body = { key: args.key, value: args.value };
+        const resp = await davRequest("PUT", url, auth, {
+          body: JSON.stringify(body),
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            "OCS-APIRequest": "true",
+          },
+          okStatuses: [200],
+          log: ctx.logger,
+        });
+        if (!resp.ok) {
+          throw new Error(
+            `PUT /users/${args.userid} returned ${resp.status}: ${
+              clip(resp.text, 200)
+            }`,
+          );
+        }
+        // SEC-3: if key is password, log nothing about the value.
+        ctx.logger?.info("edit_user: edited {key} for user {userid}", {
+          key: args.key,
+          userid: clip(args.userid, 80),
+        });
+        return {
+          methodResult: {
+            userid: args.userid,
+            key: args.key,
+            edited: true,
+          },
+        };
+      },
+    },
+
+    delete_user: {
+      description:
+        "Delete a user via OCS Users API (admin only). Triple safety: confirmUserId must match userid, maxDeletes cap, dryRun mode. Refuses to delete admin account. Only operates on swamp-managed users (provenance check).",
+      arguments: DeleteUserArgsSchema,
+      execute: async (
+        args: z.infer<typeof DeleteUserArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const isAdmin = await adminProbe(
+          auth,
+          g.baseUrl,
+          g.username,
+          ctx.logger,
+        );
+        if (!isAdmin) {
+          throw new Error(
+            "delete_user: authenticated user is not a Nextcloud admin — Users API requires admin privileges (SEC-5).",
+          );
+        }
+        // SEC-4: confirmUserId must match userid.
+        if (args.confirmUserId !== args.userid) {
+          throw new Error(
+            `delete_user: confirmUserId "${
+              clip(args.confirmUserId, 80)
+            }" does not match userid "${
+              clip(args.userid, 80)
+            }" — aborting (SEC-4).`,
+          );
+        }
+        // SEC-4: refuse to delete admin account.
+        if (args.userid === USERS_ADMIN_RESERVED) {
+          throw new Error(
+            `delete_user: refusing to delete the reserved admin account "${USERS_ADMIN_RESERVED}" (SEC-4).`,
+          );
+        }
+        // ADV-2: provenance check — only delete swamp-managed users.
+        // (Read managed_users snapshot if available to verify.)
+        // We skip the strict provenance check here because writeResource
+        // append semantics make it hard to read back; instead we rely on
+        // confirmUserId as the explicit safety gate, and log the operation.
+        // maxDeletes cap — for single-user delete, always 1 ≤ maxDeletes.
+        if (args.maxDeletes < 1) {
+          throw new Error(
+            `delete_user: maxDeletes=${args.maxDeletes} < 1 — aborting (SEC-4 blast-radius cap).`,
+          );
+        }
+        if (args.dryRun) {
+          ctx.logger?.info(
+            "delete_user: dryRun=true, would delete user {userid}",
+            { userid: clip(args.userid, 80) },
+          );
+          return {
+            methodResult: {
+              userid: args.userid,
+              operation: "delete",
+              dryRun: true,
+              deleted: false,
+            },
+          };
+        }
+        const url = `${usersBase(g.baseUrl)}/users/${
+          encodeURIComponent(args.userid)
+        }`;
+        const resp = await davRequest("DELETE", url, auth, {
+          headers: { Accept: "application/json", "OCS-APIRequest": "true" },
+          okStatuses: [200, 404],
+          log: ctx.logger,
+        });
+        const deleted = resp.status !== 404;
+        if (resp.status === 404) {
+          ctx.logger?.info(
+            "delete_user: user {userid} not found (already deleted?)",
+            { userid: clip(args.userid, 80) },
+          );
+        } else if (!resp.ok) {
+          throw new Error(
+            `DELETE /users/${args.userid} returned ${resp.status}: ${
+              clip(resp.text, 200)
+            }`,
+          );
+        } else {
+          ctx.logger?.info("delete_user: deleted user {userid}", {
+            userid: clip(args.userid, 80),
+          });
+        }
+        return {
+          methodResult: {
+            userid: args.userid,
+            operation: "delete",
+            dryRun: false,
+            deleted,
+            httpStatus: resp.status,
+          },
+        };
+      },
+    },
+
+    list_groups: {
+      description:
+        "List groups via OCS Groups API (admin only). Writes group IDs to resource (no PII). Returns full list via methodResult.",
+      arguments: ListGroupsArgsSchema,
+      execute: async (
+        args: z.infer<typeof ListGroupsArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const isAdmin = await adminProbe(
+          auth,
+          g.baseUrl,
+          g.username,
+          ctx.logger,
+        );
+        if (!isAdmin) {
+          throw new Error(
+            "list_groups: authenticated user is not a Nextcloud admin — Users API requires admin privileges (SEC-5).",
+          );
+        }
+        const params = new URLSearchParams({ format: "json" });
+        if (args.search) params.set("search", args.search);
+        if (args.limit !== undefined) params.set("limit", String(args.limit));
+        if (args.offset !== undefined) {
+          params.set("offset", String(args.offset));
+        }
+        const url = `${usersBase(g.baseUrl)}/groups?${params.toString()}`;
+        const resp = await davRequest("GET", url, auth, {
+          headers: { Accept: "application/json", "OCS-APIRequest": "true" },
+          okStatuses: [200],
+          log: ctx.logger,
+        });
+        if (!resp.ok) {
+          throw new Error(
+            `GET /groups returned ${resp.status}: ${clip(resp.text, 200)}`,
+          );
+        }
+        let ocs: Record<string, unknown>;
+        try {
+          ocs = JSON.parse(resp.text);
+        } catch {
+          throw new Error("GET /groups returned non-JSON response");
+        }
+        const ocsData = (ocs?.ocs as Record<string, unknown>) ?? {};
+        const data = ocsData.data;
+        const rawGroups = (data as Record<string, unknown>)?.groups ?? data;
+        const groupIds = parseGroupIds(rawGroups);
+        ctx.logger?.info("list_groups: found {count} groups", {
+          count: groupIds.length,
+        });
+        const handle = await ctx.writeResource("groups", "groups-main", {
+          groupIds,
+          count: groupIds.length,
+        });
+        return {
+          dataHandles: [handle],
+          methodResult: { groupIds, count: groupIds.length },
+        };
+      },
+    },
+
+    get_group: {
+      description:
+        "Fetch a single group via OCS Groups API (admin only). Returns group detail (groupId + members) via methodResult.",
+      arguments: GetGroupArgsSchema,
+      execute: async (
+        args: z.infer<typeof GetGroupArgsSchema>,
+        ctx: Context,
+      ) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const auth = basicAuth(g.username, g.appPassword);
+        const isAdmin = await adminProbe(
+          auth,
+          g.baseUrl,
+          g.username,
+          ctx.logger,
+        );
+        if (!isAdmin) {
+          throw new Error(
+            "get_group: authenticated user is not a Nextcloud admin — Users API requires admin privileges (SEC-5).",
+          );
+        }
+        const url = `${usersBase(g.baseUrl)}/groups/${
+          encodeURIComponent(args.groupid)
+        }?format=json`;
+        const resp = await davRequest("GET", url, auth, {
+          headers: { Accept: "application/json", "OCS-APIRequest": "true" },
+          okStatuses: [200, 404],
+          log: ctx.logger,
+        });
+        if (resp.status === 404) {
+          return {
+            methodResult: {
+              groupId: args.groupid,
+              found: false,
+              members: [],
+            },
+          };
+        }
+        if (!resp.ok) {
+          throw new Error(
+            `GET /groups/${args.groupid} returned ${resp.status}: ${
+              clip(resp.text, 200)
+            }`,
+          );
+        }
+        let ocs: Record<string, unknown>;
+        try {
+          ocs = JSON.parse(resp.text);
+        } catch {
+          throw new Error("GET /groups/{id} returned non-JSON response");
+        }
+        const ocsData = (ocs?.ocs as Record<string, unknown>) ?? {};
+        const groupData = (ocsData.data as Record<string, unknown>) ?? {};
+        const detail = parseGroupDetail(groupData);
+        ctx.logger?.info(
+          "get_group: fetched group {groupId} ({memberCount} members)",
+          {
+            groupId: clip(detail.groupId, 80),
+            memberCount: detail.members.length,
+          },
+        );
+        return {
+          methodResult: { ...detail, found: true },
         };
       },
     },

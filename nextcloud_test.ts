@@ -14,6 +14,7 @@ import {
   compactDate,
   ContactInputSchema,
   CONTACTS_PROVENANCE_VALUE,
+  CreateUserArgsSchema,
   davBase,
   decodeXmlEntities,
   DEFAULT_MAX_FILE_SIZE,
@@ -21,6 +22,8 @@ import {
   DeleteEventsArgsSchema,
   DeleteFileArgsSchema,
   DeleteTasksArgsSchema,
+  DeleteUserArgsSchema,
+  EditUserArgsSchema,
   escapeText,
   EventInputSchema,
   eventHref,
@@ -30,8 +33,13 @@ import {
   filesBase,
   fnv1a,
   foldLine,
+  generatePassword,
   GetFileArgsSchema,
+  GetGroupArgsSchema,
+  GetUserArgsSchema,
   GlobalArgsSchema,
+  GroupDetailSchema,
+  GroupSchema,
   hasControlChars,
   hasElement,
   hasZone,
@@ -39,6 +47,8 @@ import {
   icsHasProvenance,
   icsHasProvenanceValue,
   ListFilesArgsSchema,
+  ListGroupsArgsSchema,
+  ListUsersArgsSchema,
   MAX_LIST_ENTRIES,
   MAX_PATH_LENGTH,
   MAX_PATH_SEGMENTS,
@@ -62,13 +72,18 @@ import {
   parseCalendarReport,
   parseCalendars,
   parseFilesReport,
+  parseGroupDetail,
+  parseGroupIds,
   parseTasklists,
   parseTasksReport,
+  parseUserDetail,
+  parseUserIds,
   parseVcardMinimal,
   parseVtodoMinimal,
   PROVENANCE_PROP,
   PutFileArgsSchema,
   renderDtLine,
+  resetAdminProbeCache,
   safePath,
   sanitizeUidForPath,
   stampNotesProvenance,
@@ -79,6 +94,12 @@ import {
   tasksQueryBody,
   toCompactUtc,
   unescapeText,
+  UserDetailSchema,
+  UserSchema,
+  USERS_ADMIN_RESERVED,
+  USERS_DEFAULT_MAX_DELETES,
+  USERS_MAX_LIST,
+  usersBase,
   utcStamp,
   validateContactUid,
   validateContentType,
@@ -2290,4 +2311,286 @@ Deno.test("parseCard handles snake_case stackId", () => {
     stack_id: 10,
   });
   assertEquals(card.stackId, 10);
+});
+
+// ── OCS Users API — URL construction ───────────────────────────────────────
+
+Deno.test("usersBase strips trailing slash", () => {
+  assertEquals(
+    usersBase("https://cloud.example.com/"),
+    "https://cloud.example.com/ocs/v2.php/cloud",
+  );
+  assertEquals(
+    usersBase("https://cloud.example.com"),
+    "https://cloud.example.com/ocs/v2.php/cloud",
+  );
+});
+
+Deno.test("USERS_MAX_LIST is 500", () => {
+  assertEquals(USERS_MAX_LIST, 500);
+});
+
+Deno.test("USERS_DEFAULT_MAX_DELETES is 1", () => {
+  assertEquals(USERS_DEFAULT_MAX_DELETES, 1);
+});
+
+Deno.test("USERS_ADMIN_RESERVED is 'admin'", () => {
+  assertEquals(USERS_ADMIN_RESERVED, "admin");
+});
+
+// ── OCS Users API — CSPRNG password generation ─────────────────────────────
+
+Deno.test("generatePassword returns 22-char base64url string", () => {
+  const pw = generatePassword();
+  assertEquals(pw.length, 22, "16 bytes → 22 base64url chars (no padding)");
+  // base64url alphabet: A-Z a-z 0-9 - _
+  assert(/^[A-Za-z0-9_-]+$/.test(pw), `password has invalid chars: ${pw}`);
+});
+
+Deno.test("generatePassword never contains base64 padding", () => {
+  for (let i = 0; i < 20; i++) {
+    const pw = generatePassword();
+    assert(!pw.includes("="), `password should not contain '=': ${pw}`);
+  }
+});
+
+Deno.test("generatePassword produces distinct values (CSPRNG)", () => {
+  const passwords = new Set<string>();
+  for (let i = 0; i < 50; i++) passwords.add(generatePassword());
+  assertEquals(passwords.size, 50, "50 calls should produce 50 distinct passwords");
+});
+
+// ── OCS Users API — schemas ────────────────────────────────────────────────
+
+Deno.test("UserSchema accepts valid userId", () => {
+  const u = UserSchema.parse({ userId: "alice" });
+  assertEquals(u.userId, "alice");
+});
+
+Deno.test("UserSchema rejects empty userId", () => {
+  assertThrows(() => UserSchema.parse({ userId: "" }));
+});
+
+Deno.test("UserDetailSchema defaults email/displayname to empty", () => {
+  const d = UserDetailSchema.parse({ userId: "alice" });
+  assertEquals(d.email, "");
+  assertEquals(d.displayname, "");
+  assertEquals(d.userId, "alice");
+});
+
+Deno.test("UserDetailSchema accepts all fields", () => {
+  const d = UserDetailSchema.parse({
+    userId: "bob",
+    email: "bob@example.com",
+    displayname: "Bob Smith",
+    quota: { quota: 1024 },
+    lastLogin: 1700000000,
+    enabled: true,
+  });
+  assertEquals(d.userId, "bob");
+  assertEquals(d.lastLogin, 1700000000);
+  assertEquals(d.enabled, true);
+});
+
+Deno.test("GroupSchema accepts valid groupId", () => {
+  const g = GroupSchema.parse({ groupId: "engineering" });
+  assertEquals(g.groupId, "engineering");
+});
+
+Deno.test("GroupSchema rejects empty groupId", () => {
+  assertThrows(() => GroupSchema.parse({ groupId: "" }));
+});
+
+Deno.test("GroupDetailSchema defaults members to empty", () => {
+  const g = GroupDetailSchema.parse({ groupId: "eng" });
+  assertEquals(g.members, []);
+});
+
+Deno.test("GroupDetailSchema accepts members", () => {
+  const g = GroupDetailSchema.parse({ groupId: "eng", members: ["alice", "bob"] });
+  assertEquals(g.members.length, 2);
+});
+
+// ── OCS Users API — args schemas ───────────────────────────────────────────
+
+Deno.test("ListUsersArgsSchema accepts empty object", () => {
+  const a = ListUsersArgsSchema.parse({});
+  assertEquals(a.search, undefined);
+  assertEquals(a.limit, undefined);
+  assertEquals(a.offset, undefined);
+});
+
+Deno.test("ListUsersArgsSchema rejects limit > USERS_MAX_LIST", () => {
+  assertThrows(() => ListUsersArgsSchema.parse({ limit: 1000 }));
+});
+
+Deno.test("CreateUserArgsSchema requires userid", () => {
+  assertThrows(() => CreateUserArgsSchema.parse({}));
+});
+
+Deno.test("CreateUserArgsSchema accepts valid input", () => {
+  const a = CreateUserArgsSchema.parse({ userid: "alice" });
+  assertEquals(a.userid, "alice");
+  assertEquals(a.password, undefined);
+  assertEquals(a.groups, []);
+});
+
+Deno.test("CreateUserArgsSchema rejects userid over 64 chars", () => {
+  assertThrows(() => CreateUserArgsSchema.parse({ userid: "x".repeat(65) }));
+});
+
+Deno.test("CreateUserArgsSchema rejects invalid email", () => {
+  assertThrows(() => CreateUserArgsSchema.parse({ userid: "a", email: "not-email" }));
+});
+
+Deno.test("GetUserArgsSchema requires userid", () => {
+  assertThrows(() => GetUserArgsSchema.parse({}));
+});
+
+Deno.test("EditUserArgsSchema accepts valid input", () => {
+  const a = EditUserArgsSchema.parse({ userid: "alice", key: "email", value: "a@b.com" });
+  assertEquals(a.key, "email");
+});
+
+Deno.test("EditUserArgsSchema rejects invalid key", () => {
+  assertThrows(() =>
+    EditUserArgsSchema.parse({ userid: "a", key: "invalid", value: "x" })
+  );
+});
+
+Deno.test("DeleteUserArgsSchema requires confirmUserId", () => {
+  assertThrows(() => DeleteUserArgsSchema.parse({ userid: "alice" }));
+});
+
+Deno.test("DeleteUserArgsSchema defaults maxDeletes to USERS_DEFAULT_MAX_DELETES", () => {
+  const a = DeleteUserArgsSchema.parse({ userid: "a", confirmUserId: "a" });
+  assertEquals(a.maxDeletes, USERS_DEFAULT_MAX_DELETES);
+  assertEquals(a.dryRun, false);
+});
+
+Deno.test("DeleteUserArgsSchema accepts dryRun and maxDeletes", () => {
+  const a = DeleteUserArgsSchema.parse({
+    userid: "a",
+    confirmUserId: "a",
+    dryRun: true,
+    maxDeletes: 5,
+  });
+  assertEquals(a.dryRun, true);
+  assertEquals(a.maxDeletes, 5);
+});
+
+Deno.test("ListGroupsArgsSchema accepts empty object", () => {
+  const a = ListGroupsArgsSchema.parse({});
+  assertEquals(a.search, undefined);
+});
+
+Deno.test("GetGroupArgsSchema requires groupid", () => {
+  assertThrows(() => GetGroupArgsSchema.parse({}));
+});
+
+// ── OCS Users API — response parsers ───────────────────────────────────────
+
+Deno.test("parseUserIds extracts strings from array", () => {
+  assertEquals(parseUserIds(["alice", "bob", "charlie"]), ["alice", "bob", "charlie"]);
+});
+
+Deno.test("parseUserIds filters out non-strings and empties", () => {
+  assertEquals(parseUserIds(["alice", 42, "", null, "bob"]), ["alice", "bob"]);
+});
+
+Deno.test("parseUserIds returns empty for non-array", () => {
+  assertEquals(parseUserIds(null), []);
+  assertEquals(parseUserIds(undefined), []);
+  assertEquals(parseUserIds("not-array"), []);
+});
+
+Deno.test("parseUserDetail handles standard fields", () => {
+  const d = parseUserDetail({
+    id: "alice",
+    email: "alice@example.com",
+    "display-name": "Alice Liddell",
+    quota: { quota: 1024 },
+    lastLogin: 1700000000,
+    enabled: true,
+  });
+  assertEquals(d.userId, "alice");
+  assertEquals(d.email, "alice@example.com");
+  assertEquals(d.displayname, "Alice Liddell");
+  assertEquals(d.lastLogin, 1700000000);
+});
+
+Deno.test("parseUserDetail handles snake_case fallback fields", () => {
+  const d = parseUserDetail({ userid: "bob", displayname: "Bob" });
+  assertEquals(d.userId, "bob");
+  assertEquals(d.displayname, "Bob");
+});
+
+Deno.test("parseUserDetail defaults missing fields", () => {
+  const d = parseUserDetail({});
+  assertEquals(d.userId, "");
+  assertEquals(d.email, "");
+  assertEquals(d.displayname, "");
+});
+
+Deno.test("parseGroupIds extracts strings from array", () => {
+  assertEquals(parseGroupIds(["eng", "ops"]), ["eng", "ops"]);
+});
+
+Deno.test("parseGroupIds filters out non-strings and empties", () => {
+  assertEquals(parseGroupIds(["eng", 42, "", null, "ops"]), ["eng", "ops"]);
+});
+
+Deno.test("parseGroupIds returns empty for non-array", () => {
+  assertEquals(parseGroupIds(null), []);
+  assertEquals(parseGroupIds(undefined), []);
+});
+
+Deno.test("parseGroupDetail extracts members", () => {
+  const g = parseGroupDetail({ id: "eng", users: ["alice", "bob"] });
+  assertEquals(g.groupId, "eng");
+  assertEquals(g.members, ["alice", "bob"]);
+});
+
+Deno.test("parseGroupDetail handles snake_case groupid", () => {
+  const g = parseGroupDetail({ groupid: "eng", users: ["alice"] });
+  assertEquals(g.groupId, "eng");
+});
+
+Deno.test("parseGroupDetail defaults empty members for missing users", () => {
+  const g = parseGroupDetail({ id: "eng" });
+  assertEquals(g.members, []);
+});
+
+Deno.test("parseGroupDetail filters non-string members", () => {
+  const g = parseGroupDetail({ id: "eng", users: ["alice", 42, null, "bob"] });
+  assertEquals(g.members, ["alice", "bob"]);
+});
+
+// ── OCS Users API — admin probe cache reset ────────────────────────────────
+
+Deno.test("resetAdminProbeCache is callable (no throw)", () => {
+  resetAdminProbeCache();
+  // Calling twice should also be safe.
+  resetAdminProbeCache();
+});
+
+// ── OCS Users API — delete_user safety (schema-level checks) ───────────────
+
+Deno.test("DeleteUserArgsSchema rejects negative maxDeletes", () => {
+  assertThrows(() =>
+    DeleteUserArgsSchema.parse({
+      userid: "a",
+      confirmUserId: "a",
+      maxDeletes: -1,
+    })
+  );
+});
+
+Deno.test("DeleteUserArgsSchema allows maxDeletes=0 (full-lock)", () => {
+  const a = DeleteUserArgsSchema.parse({
+    userid: "a",
+    confirmUserId: "a",
+    maxDeletes: 0,
+  });
+  assertEquals(a.maxDeletes, 0);
 });
